@@ -1,0 +1,7 @@
+qwen-asr
+soundfile
+fastapi
+uvicorn
+modelscope
+huggingface_hub
+funasr

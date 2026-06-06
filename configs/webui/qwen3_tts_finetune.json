@@ -1,0 +1,21 @@
+{
+  "audio": "D:\\训练集\\音频_暖暖\\总和\\WAV",
+  "output_mode": "custom",
+  "output_dir": "E:\\models\\Qwen3-TTS_LoRA\\asr_output",
+  "dataset_format": "qwen3_tts",
+  "ref_audio": "",
+  "hotword_library": "Nikki.txt",
+  "hotword_text": "",
+  "asr_ckpt": ".\\models\\Qwen3-ASR-1.7B",
+  "aligner_ckpt": ".\\models\\Qwen3-ForcedAligner-0.6B",
+  "language": "Chinese",
+  "punc_model": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+  "batch_size": 1,
+  "pause_threshold": 1.0,
+  "min_dur": 3.0,
+  "max_dur": 20.0,
+  "pad_left": 0.1,
+  "pad_right": 0.1,
+  "eta_rtf": 2.0,
+  "scan_subfolders": true
+}

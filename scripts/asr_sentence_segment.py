@@ -1,0 +1,1086 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+离线音频 -> Qwen3-ASR 转写+对齐 -> 句子级切分 -> 每句导出 wav/txt/index.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
+
+import soundfile as sf
+
+
+# 贪心分句使用的边界集合。
+STRONG_BOUNDARIES = {"。", "！", "？", "?", "!"}
+SOFT_BOUNDARIES = {"，", ",", "；", ";"}
+COMMON_PUNCTS = STRONG_BOUNDARIES | SOFT_BOUNDARIES | {
+    "：",
+    ":",
+    "、",
+    "“",
+    "”",
+    '"',
+    "‘",
+    "’",
+    "'",
+    "（",
+    "）",
+    "(",
+    ")",
+    "【",
+    "】",
+    "<",
+    ">",
+    "—",
+    "-",
+}
+
+DEFAULT_SPLIT_DEFAULTS: dict[str, float] = {
+    "pause_threshold": 0.60,
+    "min_dur": 0.80,
+    "max_dur": 8.00,
+    "pad_left": 0.05,
+    "pad_right": 0.10,
+}
+
+
+@dataclass
+class CharStamp:
+    char: str
+    start: float
+    end: float
+
+
+def log(msg: str) -> None:
+    print(f"[asr] {msg}", flush=True)
+
+
+def format_seconds_short(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    if m > 0:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def get_field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def safe_filename_from_text(text: str, max_len: int = 80) -> str:
+    """
+    将识别文本转换为适合 Windows 的文件名主体。
+    保留可读内容，同时避开非法字符和过长文件名。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "segment"
+
+    # 用空格替换非法字符和控制字符，保证 Windows 文件名安全。
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+
+    if not cleaned:
+        cleaned = "segment"
+
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+        if not cleaned:
+            cleaned = "segment"
+    return cleaned
+
+
+def to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def read_split_defaults() -> dict[str, float]:
+    defaults = dict(DEFAULT_SPLIT_DEFAULTS)
+    config_path = project_root() / "configs" / "defaults.json"
+    if not config_path.exists():
+        return defaults
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        for key, fallback in DEFAULT_SPLIT_DEFAULTS.items():
+            try:
+                defaults[key] = float(payload.get(key, fallback))
+            except Exception:
+                defaults[key] = fallback
+    except Exception:
+        return defaults
+    return defaults
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def default_out_dir() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return project_root() / "outputs" / f"run_{stamp}"
+
+
+def normalize_language(language: str) -> Optional[str]:
+    if language is None:
+        return None
+    v = language.strip().lower()
+    if v in {"", "none", "auto", "null"}:
+        return None
+    return language
+
+
+def qwen3_tts_language_label(language: str) -> str:
+    normalized = normalize_language(language)
+    if normalized is None:
+        return "Auto"
+    return str(normalized).strip() or "Auto"
+
+
+def validate_wav_output(wav_path: Path, purpose: str) -> None:
+    if not wav_path.exists():
+        raise RuntimeError(f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：未生成输出文件 {wav_path}")
+
+    file_size = wav_path.stat().st_size
+    if file_size <= 44:
+        raise RuntimeError(
+            f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：输出文件过小 {wav_path}（{file_size} 字节）"
+        )
+
+    try:
+        info = sf.info(str(wav_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：输出文件无法被音频库读取 {wav_path}"
+        ) from exc
+
+    if info.frames <= 0 or info.samplerate <= 0 or info.channels <= 0:
+        raise RuntimeError(
+            f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：没有有效音频数据 {wav_path}"
+        )
+
+
+def ffmpeg_convert_to_wav16k_mono(src_audio: Path, dst_wav: Path) -> None:
+    if not src_audio.exists():
+        raise FileNotFoundError(f"输入音频不存在: {src_audio}")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src_audio),
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(dst_wav),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        _ = proc.stdout
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffmpeg，请先安装并确保 ffmpeg 在 PATH 中。") from exc
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.stderr or "").strip()
+        raise RuntimeError(f"ffmpeg 转码失败: {msg[-500:]}") from exc
+    validate_wav_output(dst_wav, "转码")
+
+
+def get_wav_duration_seconds(wav_path: Path) -> float:
+    info = sf.info(str(wav_path))
+    if info.samplerate <= 0:
+        return 0.0
+    return float(info.frames) / float(info.samplerate)
+
+
+def probe_audio_stream_info(src_audio: Path) -> Tuple[int, int]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate,channels",
+        "-of",
+        "json",
+        str(src_audio),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffprobe，请先安装 ffmpeg 并确保 ffprobe 在 PATH 中。") from exc
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.stderr or "").strip()
+        raise RuntimeError(f"ffprobe 读取音频信息失败: {msg[-500:]}") from exc
+
+    try:
+        data = json.loads(proc.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            raise ValueError("no audio streams")
+        st = streams[0]
+        sr = int(st.get("sample_rate"))
+        ch = int(st.get("channels"))
+        if sr <= 0 or ch <= 0:
+            raise ValueError("invalid sample rate/channels")
+        return sr, ch
+    except Exception as exc:
+        raise RuntimeError("无法解析输入音频的采样率/声道信息。") from exc
+
+
+def ffmpeg_export_segment_from_source(
+    src_audio: Path,
+    dst_wav: Path,
+    start: float,
+    end: float,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    if end <= start:
+        raise ValueError("segment end time must be greater than start time")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-i",
+        str(src_audio),
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map",
+        "0:a:0",
+        "-ac",
+        str(channels),
+        "-ar",
+        str(sample_rate),
+        "-c:a",
+        "pcm_s16le",
+        str(dst_wav),
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("未找到 ffmpeg，请先安装并确保 ffmpeg 在 PATH 中。") from exc
+    except subprocess.CalledProcessError as exc:
+        msg = (exc.stderr or "").strip()
+        raise RuntimeError(f"导出切片失败: {msg[-500:]}") from exc
+    validate_wav_output(dst_wav, "切片")
+
+
+def quiet_transformers_logging() -> None:
+    # 减少长任务中的重复生成日志。
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
+def pick_device_and_dtype(force_cpu: bool = False) -> Tuple[str, Any]:
+    import torch
+
+    if not force_cpu and torch.cuda.is_available():
+        device = "cuda:0"
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+        return device, dtype
+    return "cpu", torch.float32
+
+
+def load_qwen_asr_model(
+    asr_ckpt: str,
+    aligner_ckpt: str,
+    max_new_tokens: int,
+    batch_size: int,
+    force_cpu: bool = False,
+) -> Any:
+    from qwen_asr import Qwen3ASRModel
+
+    device, dtype = pick_device_and_dtype(force_cpu=force_cpu)
+    requested_batch_size = max(1, int(batch_size or 1))
+    common_kwargs = {
+        "dtype": dtype,
+        "device_map": device,
+        "forced_aligner": aligner_ckpt,
+        "forced_aligner_kwargs": {
+            "dtype": dtype,
+            "device_map": device,
+        },
+    }
+
+    try:
+        model = Qwen3ASRModel.from_pretrained(
+            asr_ckpt,
+            max_inference_batch_size=requested_batch_size,
+            max_new_tokens=max_new_tokens,
+            **common_kwargs,
+        )
+    except TypeError:
+        # 兼容不同 qwen-asr 版本的参数签名。
+        try:
+            model = Qwen3ASRModel.from_pretrained(
+                asr_ckpt,
+                max_inference_batch_size=requested_batch_size,
+                **common_kwargs,
+            )
+        except TypeError:
+            model = Qwen3ASRModel.from_pretrained(
+                asr_ckpt,
+                **common_kwargs,
+            )
+
+    return model
+
+
+def is_memory_pressure_error(exc: BaseException) -> bool:
+    message = str(exc)
+    lowered = message.lower()
+    return (
+        "cuda out of memory" in lowered
+        or "out of memory" in lowered
+        or "显存不足" in message
+        or "cannot allocate memory" in lowered
+    )
+
+
+def clear_cuda_cache() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def transcribe_with_timestamps(
+    model: Any,
+    wav_path: Path,
+    language: Optional[str],
+    context: str = "",
+    wav_duration_sec: float = 0.0,
+    progress_interval_sec: int = 30,
+    eta_rtf: float = 2.0,
+) -> Tuple[str, Sequence[Any], Optional[str]]:
+    start_ts = time.time()
+    done = threading.Event()
+    safe_rtf = max(0.05, float(eta_rtf))
+    expected_total = max(5.0, float(wav_duration_sec) / safe_rtf)
+    log(
+        "步骤 3/5 预计总耗时 ~"
+        f"{format_seconds_short(expected_total)} "
+        f"(估算速度 {safe_rtf:.2f}x 实时，仅供参考)"
+    )
+
+    def heartbeat() -> None:
+        while not done.wait(progress_interval_sec):
+            elapsed = float(time.time() - start_ts)
+            remaining = max(0.0, expected_total - elapsed)
+            progress = min(99.0, (elapsed / expected_total) * 100.0)
+            log(
+                "步骤 3/5 仍在运行... 已耗时 "
+                f"{format_seconds_short(elapsed)} | "
+                f"预计剩余 ~{format_seconds_short(remaining)} | "
+                f"进度约 {progress:.0f}%"
+            )
+
+    t = threading.Thread(target=heartbeat, daemon=True)
+    t.start()
+    try:
+        result = model.transcribe(
+            audio=str(wav_path),
+            language=language,
+            context=context or "",
+            return_time_stamps=True,
+        )
+    finally:
+        done.set()
+        t.join(timeout=0.1)
+
+    elapsed = float(time.time() - start_ts)
+    speed_x = (float(wav_duration_sec) / elapsed) if elapsed > 0 else 0.0
+    log(
+        "步骤 3/5 完成，用时 "
+        f"{format_seconds_short(elapsed)} "
+        f"(约 {speed_x:.2f}x 实时)"
+    )
+    if not result:
+        return "", [], None
+
+    first = result[0] if isinstance(result, (list, tuple)) else result
+    text = str(get_field(first, "text", "") or "")
+    time_stamps = get_field(first, "time_stamps", None)
+    out_lang = get_field(first, "language", None)
+
+    if not time_stamps:
+        if not text.strip():
+            return text, [], out_lang
+        raise RuntimeError(
+            "未拿到 time_stamps。请确认 forced aligner 模型可用，并使用 Qwen3-ForcedAligner。"
+        )
+    return text, time_stamps, out_lang
+
+
+def parse_unit_timestamps(time_stamps: Sequence[Any]) -> List[Tuple[str, float, float]]:
+    units: List[Tuple[str, float, float]] = []
+    for item in time_stamps:
+        text = str(get_field(item, "text", "") or "")
+        if not text:
+            continue
+        start = to_float(get_field(item, "start_time", get_field(item, "start", None)))
+        end = to_float(get_field(item, "end_time", get_field(item, "end", None)))
+        if start is None or end is None:
+            continue
+        if end < start:
+            continue
+        units.append((text, start, end))
+    units.sort(key=lambda x: (x[1], x[2]))
+    return units
+
+
+def expand_units_to_char_timeline(units: Sequence[Tuple[str, float, float]]) -> List[CharStamp]:
+    timeline: List[CharStamp] = []
+    for text, start, end in units:
+        chars = list(text)
+        if not chars:
+            continue
+        total = max(end - start, 1e-6)
+        n = len(chars)
+        # Qwen3 的 unit.text 可能包含多个字符，这里按字符均分时间。
+        for i, ch in enumerate(chars):
+            c_start = start + total * (i / n)
+            c_end = start + total * ((i + 1) / n)
+            timeline.append(CharStamp(char=ch, start=float(c_start), end=float(c_end)))
+    return timeline
+
+
+def extract_text_from_punc_result(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        text = obj.get("text")
+        if isinstance(text, str):
+            return text
+        if "value" in obj and isinstance(obj["value"], str):
+            return obj["value"]
+        return None
+    if isinstance(obj, list) and obj:
+        for item in obj:
+            text = extract_text_from_punc_result(item)
+            if text:
+                return text
+    return None
+
+
+def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
+    try:
+        from funasr import AutoModel
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少 funasr。请先运行 .\\bootstrap.ps1 -InstallFunASR，安装完成后再启用标点恢复。") from exc
+
+    try:
+        # disable_update=True 只关闭 FunASR 的“启动时检查新版”行为，不影响标点模型本身的下载和推理。
+        # 这样做可以减少每次任务启动时的联网检查时间；如果旧版 FunASR 不支持该参数，就回退到兼容写法。
+        model = AutoModel(model=punc_model_name, disable_update=True)
+    except TypeError:
+        model = AutoModel(model=punc_model_name)
+    output = model.generate(input=raw_text)
+    text = extract_text_from_punc_result(output)
+    return text if text else raw_text
+
+
+def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: str) -> List[CharStamp]:
+    if not raw_timeline:
+        return []
+
+    base_chars = [c.char for c in raw_timeline]
+    merged: List[CharStamp] = []
+    i = 0
+
+    for ch in punc_text:
+        if ch.isspace():
+            continue
+
+        if i < len(base_chars) and ch == base_chars[i]:
+            ref = raw_timeline[i]
+            merged.append(CharStamp(ch, ref.start, ref.end))
+            i += 1
+            continue
+
+        if ch in COMMON_PUNCTS:
+            # 标点是新增字符时，把时间点挂到前一个字符尾部，或当前字符起点。
+            if merged:
+                t = merged[-1].end
+            elif i < len(raw_timeline):
+                t = raw_timeline[i].start
+            else:
+                t = 0.0
+            merged.append(CharStamp(ch, t, t))
+            continue
+
+        # 轻量纠偏：向后查找一个短窗口内的匹配字符。
+        matched = False
+        for j in range(i + 1, min(i + 8, len(base_chars))):
+            if base_chars[j] == ch:
+                ref = raw_timeline[j]
+                merged.append(CharStamp(ch, ref.start, ref.end))
+                i = j + 1
+                matched = True
+                break
+        if matched:
+            continue
+
+        if i < len(raw_timeline):
+            ref = raw_timeline[i]
+            merged.append(CharStamp(ch, ref.start, ref.end))
+            i += 1
+        else:
+            t = merged[-1].end if merged else 0.0
+            merged.append(CharStamp(ch, t, t))
+
+    return merged if merged else list(raw_timeline)
+
+
+def collect_pause_edges(timeline: Sequence[CharStamp], pause_threshold: float) -> set[int]:
+    edges: set[int] = set()
+    for i in range(len(timeline) - 1):
+        gap = timeline[i + 1].start - timeline[i].end
+        if gap >= pause_threshold:
+            edges.add(i)
+    return edges
+
+
+def greedy_sentence_split(
+    timeline: Sequence[CharStamp],
+    audio_duration: float,
+    pause_threshold: float,
+    min_dur: float,
+    max_dur: float,
+    pad_left: float,
+    pad_right: float,
+) -> List[dict]:
+    if not timeline:
+        return []
+
+    pause_edges = collect_pause_edges(timeline, pause_threshold)
+    n = len(timeline)
+    i = 0
+    chunks: List[dict] = []
+
+    while i < n:
+        start_t = timeline[i].start
+        max_end_t = start_t + max_dur
+        hard_end = i
+        while hard_end + 1 < n and timeline[hard_end + 1].end <= max_end_t:
+            hard_end += 1
+
+        strong_candidates: List[int] = []
+        soft_candidates: List[int] = []
+        pause_candidates: List[int] = []
+
+        for j in range(i, hard_end + 1):
+            cur_dur = timeline[j].end - start_t
+            if cur_dur < min_dur:
+                continue
+            ch = timeline[j].char
+            if ch in STRONG_BOUNDARIES:
+                strong_candidates.append(j)
+            elif ch in SOFT_BOUNDARIES:
+                soft_candidates.append(j)
+            if j in pause_edges:
+                pause_candidates.append(j)
+
+        # 贪心策略：强边界 > 软边界 > 停顿边界 > 硬切。
+        if strong_candidates:
+            end_idx = strong_candidates[-1]
+        elif soft_candidates:
+            end_idx = soft_candidates[-1]
+        elif pause_candidates:
+            end_idx = pause_candidates[-1]
+        else:
+            end_idx = hard_end
+            # 片段太短时继续延长，直到满足最小时长。
+            while end_idx + 1 < n and (timeline[end_idx].end - start_t) < min_dur:
+                end_idx += 1
+
+        if end_idx < i:
+            end_idx = i
+
+        text = "".join(c.char for c in timeline[i : end_idx + 1]).strip()
+        seg_start = max(0.0, timeline[i].start - pad_left)
+        seg_end = min(audio_duration, timeline[end_idx].end + pad_right)
+
+        if text and seg_end > seg_start:
+            chunks.append(
+                {
+                    "char_start_idx": i,
+                    "char_end_idx": end_idx,
+                    "start": float(seg_start),
+                    "end": float(seg_end),
+                    "text": text,
+                }
+            )
+
+        i = end_idx + 1
+
+    # 收尾：如果最后一段过短，合并到前一段，减少碎片。
+    if len(chunks) >= 2:
+        last = chunks[-1]
+        if (last["end"] - last["start"]) < max(0.3, min_dur * 0.6):
+            prev = chunks[-2]
+            prev["end"] = last["end"]
+            prev["char_end_idx"] = last["char_end_idx"]
+            prev["text"] = (prev["text"] + last["text"]).strip()
+            chunks.pop()
+
+    return chunks
+
+
+def write_segments_and_index(
+    source_audio: Path,
+    segments: Sequence[dict],
+    out_dir: Path,
+) -> List[dict[str, Any]]:
+    seg_dir = out_dir / "segments"
+    ensure_dir(seg_dir)
+    sample_rate, channels = probe_audio_stream_info(source_audio)
+    log(f"导出音频规格: {sample_rate} Hz / {channels} ch（与输入保持一致）")
+    used_name_count: dict[str, int] = {}
+    written_segments: List[dict[str, Any]] = []
+
+    index_path = out_dir / "index.jsonl"
+    with index_path.open("w", encoding="utf-8") as f_index:
+        for idx, seg in enumerate(segments, start=1):
+            start = float(seg["start"])
+            end = float(seg["end"])
+            text = str(seg["text"]).strip()
+            if not text:
+                continue
+
+            if end <= start:
+                continue
+
+            base = safe_filename_from_text(text, max_len=80)
+            n = used_name_count.get(base, 0) + 1
+            used_name_count[base] = n
+            basename = base if n == 1 else f"{base}_{n}"
+
+            wav_name = basename + ".wav"
+            txt_name = basename + ".txt"
+
+            wav_rel = Path("segments") / wav_name
+            txt_rel = Path("segments") / txt_name
+            wav_out = out_dir / wav_rel
+            txt_out = out_dir / txt_rel
+
+            ffmpeg_export_segment_from_source(
+                src_audio=source_audio,
+                dst_wav=wav_out,
+                start=start,
+                end=end,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
+            txt_out.write_text(text + "\n", encoding="utf-8")
+
+            line = {
+                "id": f"seg_{idx:04d}",
+                "wav": wav_rel.as_posix(),
+                "txt": txt_rel.as_posix(),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": text,
+            }
+            f_index.write(json.dumps(line, ensure_ascii=False) + "\n")
+            written_segments.append(
+                {
+                    **line,
+                    "wav_path": wav_out,
+                    "txt_path": txt_out,
+                }
+            )
+
+    return written_segments
+
+
+def export_qwen3_tts_manifest(
+    exported_segments: Sequence[dict[str, Any]],
+    out_dir: Path,
+    ref_audio: str,
+    language: str,
+) -> Path:
+    ref_audio_value = (ref_audio or "").strip()
+    data_audio_dir = out_dir / "data" / "audio"
+    ensure_dir(data_audio_dir)
+    manifest_path = out_dir / "qwen3_tts.jsonl"
+    ref_audio_rel = ""
+
+    # 参考音频只是可选附加字段，不影响 ASR 主流程。
+    # 不填写时，仍然导出可直接用于后续整理/微调的数据清单。
+    if ref_audio_value:
+        ref_audio_path = Path(ref_audio_value).expanduser().resolve()
+        if not ref_audio_path.exists():
+            raise FileNotFoundError(f"参考音频不存在: {ref_audio_path}")
+        if not ref_audio_path.is_file():
+            raise FileNotFoundError(f"参考音频不是文件: {ref_audio_path}")
+
+        data_ref_dir = out_dir / "data" / "ref"
+        ensure_dir(data_ref_dir)
+
+        ref_copy_path = data_ref_dir / ref_audio_path.name
+        if ref_audio_path != ref_copy_path:
+            shutil.copy2(ref_audio_path, ref_copy_path)
+
+        ref_audio_rel = (Path("data") / "ref" / ref_copy_path.name).as_posix()
+
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        for idx, seg in enumerate(exported_segments, start=1):
+            wav_src = Path(seg["wav_path"])
+            utt_name = f"utt{idx:04d}.wav"
+            wav_dst = data_audio_dir / utt_name
+            shutil.copy2(wav_src, wav_dst)
+
+            payload = {
+                "audio": (Path("data") / "audio" / utt_name).as_posix(),
+                "text": str(seg["text"]),
+                "language": language,
+            }
+            if ref_audio_rel:
+                payload["ref_audio"] = ref_audio_rel
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    return manifest_path
+
+
+def parse_args() -> argparse.Namespace:
+    split_defaults = read_split_defaults()
+    parser = argparse.ArgumentParser(
+        description="Qwen3-ASR + Qwen3-ForcedAligner sentence-level segmentation tool."
+    )
+    parser.add_argument("--audio", required=True, help="Input audio file path")
+    parser.add_argument("--out_dir", default="", help="Output directory (auto if empty)")
+    parser.add_argument(
+        "--asr_ckpt",
+        default="Qwen/Qwen3-ASR-1.7B",
+        help="ASR model name or local path",
+    )
+    parser.add_argument(
+        "--aligner_ckpt",
+        default="Qwen/Qwen3-ForcedAligner-0.6B",
+        help="Forced aligner model name or local path",
+    )
+    parser.add_argument(
+        "--language",
+        default="Chinese",
+        help='Language, e.g. "Chinese"; use "None" for auto detect',
+    )
+    parser.add_argument(
+        "--punc_model",
+        default="",
+        help="Optional punctuation model name",
+    )
+    parser.add_argument(
+        "--pause_threshold",
+        type=float,
+        default=split_defaults["pause_threshold"],
+        help="Pause split threshold (s)",
+    )
+    parser.add_argument("--min_dur", type=float, default=split_defaults["min_dur"], help="Minimum sentence duration (s)")
+    parser.add_argument("--max_dur", type=float, default=split_defaults["max_dur"], help="Maximum sentence duration (s)")
+    parser.add_argument("--pad_left", type=float, default=split_defaults["pad_left"], help="Left padding (s)")
+    parser.add_argument("--pad_right", type=float, default=split_defaults["pad_right"], help="Right padding (s)")
+    parser.add_argument("--max_new_tokens", type=int, default=15000, help="ASR max_new_tokens")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="ASR 推理批大小。值越大通常越快，但显存占用也越高；保守值建议从 1 开始",
+    )
+    parser.add_argument("--eta_rtf", type=float, default=2.0, help="ETA speed assumption (x realtime)")
+    parser.add_argument(
+        "--dataset_format",
+        default="standard",
+        choices=["standard", "qwen3_tts"],
+        help="附加导出格式：standard 仅输出 index.jsonl；qwen3_tts 额外输出可用于 Qwen3-TTS 微调的 qwen3_tts.jsonl",
+    )
+    parser.add_argument(
+        "--ref_audio",
+        default="",
+        help="可选。Qwen3-TTS 导出时写入 ref_audio 字段的参考音频路径；不填则导出不带 ref_audio 的清单",
+    )
+    parser.add_argument(
+        "--hotword_file",
+        default="",
+        help="热词文件路径（每行一个词）。会转成识别上下文，帮助模型更稳定地识别专有名词",
+    )
+    return parser.parse_args()
+
+
+def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = False) -> int:
+    dataset_format = str(args.dataset_format or "standard").strip().lower()
+    if batch_size < 1:
+        raise ValueError("batch_size 必须是大于等于 1 的整数。")
+
+    audio_path = Path(args.audio).expanduser().resolve()
+    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else default_out_dir()
+    ensure_dir(out_dir)
+    tmp_dir = out_dir / "_tmp"
+    ensure_dir(tmp_dir)
+
+    wav_path = tmp_dir / "input_16k_mono.wav"
+    log(f"输入音频: {audio_path}")
+    log(f"输出目录: {out_dir}")
+    log(f"运行设备: {'CPU（已自动回退）' if force_cpu else '自动选择 CUDA / CPU'}")
+    log("步骤 1/5: ffmpeg 转为 16k mono wav")
+    ffmpeg_convert_to_wav16k_mono(audio_path, wav_path)
+    wav_dur_sec = get_wav_duration_seconds(wav_path)
+    log(f"音频时长: {wav_dur_sec / 60.0:.2f} 分钟")
+
+    quiet_transformers_logging()
+    log("步骤 2/5: 加载 Qwen3-ASR + ForcedAligner")
+    log(f"ASR 批大小(batch_size): {batch_size}")
+    model = load_qwen_asr_model(
+        asr_ckpt=args.asr_ckpt,
+        aligner_ckpt=args.aligner_ckpt,
+        max_new_tokens=args.max_new_tokens,
+        batch_size=batch_size,
+        force_cpu=force_cpu,
+    )
+
+    hotword_context = ""
+    hotword_file = str(args.hotword_file or "").strip()
+    if hotword_file:
+        hotword_path = Path(hotword_file).expanduser().resolve()
+        if hotword_path.exists() and hotword_path.is_file():
+            raw_lines = hotword_path.read_text(encoding="utf-8", errors="replace").strip()
+            entries = [line.strip() for line in raw_lines.splitlines() if line.strip()]
+            if entries:
+                hotword_context = "热词提示：" + "、".join(entries)
+                log(f"已加载 {len(entries)} 条热词作为识别上下文")
+        else:
+            log(f"热词文件不存在，忽略：{hotword_path}")
+
+    log("步骤 3/5: 执行 ASR 并获取时间戳")
+    text, time_stamps, detected_lang = transcribe_with_timestamps(
+        model=model,
+        wav_path=wav_path,
+        language=normalize_language(args.language),
+        context=hotword_context,
+        wav_duration_sec=wav_dur_sec,
+        progress_interval_sec=30,
+        eta_rtf=float(args.eta_rtf),
+    )
+    log(f"识别语言: {detected_lang or 'unknown'}")
+
+    warning_message = ""
+    units = parse_unit_timestamps(time_stamps) if time_stamps else []
+    if not text.strip() and not units:
+        warning_message = "音频可能为静默、噪声过大，或未包含可识别语音，最终结果为空"
+        log(f"警告: {warning_message}")
+        char_timeline: List[CharStamp] = []
+    else:
+        if not units:
+            raise RuntimeError("time_stamps 无可用 unit，无法切分。")
+
+        char_timeline = expand_units_to_char_timeline(units)
+        if not char_timeline:
+            raise RuntimeError("字符级时间线为空，无法切分。")
+
+    if char_timeline and args.punc_model.strip():
+        log("步骤 4/5: 执行可选标点恢复")
+        try:
+            punc_text = apply_punctuation(text, args.punc_model.strip())
+            char_timeline = merge_punc_text_to_timeline(char_timeline, punc_text)
+            text = punc_text
+        except Exception as exc:
+            log(f"标点恢复失败，继续使用原始文本: {exc}")
+    elif char_timeline:
+        log("步骤 4/5: 跳过标点恢复（未设置 --punc_model）")
+    else:
+        log("步骤 4/5: 没有可导出的内容，跳过标点恢复")
+
+    duration = float(wav_dur_sec)
+
+    log("步骤 5/5: 贪心分句并导出片段")
+    segments = greedy_sentence_split(
+        timeline=char_timeline,
+        audio_duration=duration,
+        pause_threshold=float(args.pause_threshold),
+        min_dur=float(args.min_dur),
+        max_dur=float(args.max_dur),
+        pad_left=float(args.pad_left),
+        pad_right=float(args.pad_right),
+    )
+    if not segments and not warning_message:
+        warning_message = "脚本运行成功，但没有得到可导出的语音片段。音频可能为静默、噪声过大，或未包含可识别语音。"
+        log(f"警告: {warning_message}")
+    exported_segments = write_segments_and_index(source_audio=audio_path, segments=segments, out_dir=out_dir)
+
+    qwen3_tts_manifest_path: Optional[Path] = None
+    if dataset_format == "qwen3_tts":
+        if str(args.ref_audio or "").strip():
+            log("附加导出: 生成 Qwen3-TTS 微调清单（包含参考音频字段）")
+        else:
+            log("附加导出: 生成 Qwen3-TTS 微调清单（不包含参考音频字段）")
+        qwen3_tts_manifest_path = export_qwen3_tts_manifest(
+            exported_segments=exported_segments,
+            out_dir=out_dir,
+            ref_audio=args.ref_audio,
+            language=qwen3_tts_language_label(args.language),
+        )
+
+    (out_dir / "full_text.txt").write_text(text.strip() + "\n", encoding="utf-8")
+    (out_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "audio": str(audio_path),
+                "wav_16k_mono": str(wav_path),
+                "asr_ckpt": args.asr_ckpt,
+                "aligner_ckpt": args.aligner_ckpt,
+                "language": args.language,
+                "batch_size": batch_size,
+                "requested_batch_size": int(args.batch_size),
+                "runtime_device": "cpu_fallback" if force_cpu else "auto",
+                "detected_language": detected_lang,
+                "punc_model": args.punc_model,
+                "pause_threshold": args.pause_threshold,
+                "min_dur": args.min_dur,
+                "max_dur": args.max_dur,
+                "pad_left": args.pad_left,
+                "pad_right": args.pad_right,
+                "eta_rtf": args.eta_rtf,
+                "dataset_format": dataset_format,
+                "ref_audio": args.ref_audio,
+                "segments": len(segments),
+                **({"warning": warning_message} if warning_message else {}),
+                "qwen3_tts_manifest": (
+                    qwen3_tts_manifest_path.name if qwen3_tts_manifest_path else ""
+                ),
+                "qwen3_tts_entries": len(exported_segments) if qwen3_tts_manifest_path else 0,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if len(segments) == 0:
+        log("完成，脚本运行成功，但没有得到可导出的语音片段（0 段）。")
+    else:
+        log(f"完成，导出 {len(segments)} 段。")
+    log(f"索引文件: {out_dir / 'index.jsonl'}")
+    if qwen3_tts_manifest_path:
+        log(f"Qwen3-TTS 清单: {qwen3_tts_manifest_path}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    requested_batch_size = int(args.batch_size)
+    if requested_batch_size < 1:
+        raise ValueError("batch_size 必须是大于等于 1 的整数。")
+
+    try:
+        return run_pipeline(args, batch_size=requested_batch_size, force_cpu=False)
+    except Exception as exc:
+        if not is_memory_pressure_error(exc):
+            raise
+
+        clear_cuda_cache()
+        if requested_batch_size > 1:
+            log("检测到显存不足，自动将 batch_size 降到 1 并重试。")
+            try:
+                return run_pipeline(args, batch_size=1, force_cpu=False)
+            except Exception as retry_exc:
+                if not is_memory_pressure_error(retry_exc):
+                    raise
+
+                clear_cuda_cache()
+
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+
+        if cuda_available:
+            log("batch_size=1 仍然显存不足，自动切换到 CPU 再试一次。")
+            clear_cuda_cache()
+            return run_pipeline(args, batch_size=1, force_cpu=True)
+
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n[asr] 用户中断。", file=sys.stderr)
+        raise SystemExit(130)
+

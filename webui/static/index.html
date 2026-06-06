@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Qwen3-ASR 本地识别入口</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css?v=dark-20260603">
+</head>
+<body>
+  <main class="layout">
+    <header class="panel hero">
+      <div>
+        <p class="eyebrow">新手入口</p>
+        <h1>Qwen3-ASR 本地识别入口</h1>
+        <p id="statusStrip"></p>
+        <p id="startupHint" class="section-note"></p>
+      </div>
+      <div class="row hero-actions">
+        <button id="openInputsBtn">打开输入目录</button>
+        <button id="openProjectBtn">打开项目目录</button>
+        <button id="openOutputsBtn">打开输出目录</button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>开始前检查</h2>
+      <div id="environmentBoard" class="status-grid"></div>
+      <div id="quickActions" class="action-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>任务配置</h2>
+      <p class="section-note">热词规则：临时热词优先于热词库；不懂的参数先保持默认。</p>
+      <div class="row task-title-row">
+        <label for="taskTitle">任务标题（可选）</label>
+        <input id="taskTitle" type="text" placeholder="例如：批量识别-第1批">
+      </div>
+      <div id="formGroups" class="form-grid"></div>
+      <div class="row">
+        <button id="saveDefaultsBtn">保存偏好</button>
+        <button class="primary" id="submitTaskBtn">提交识别任务</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>任务队列</h2>
+      <div id="historyList" class="list"></div>
+      <div class="progress-wrap">
+        <div id="progressLabel">暂无运行中的任务</div>
+        <div class="progress-track"><div id="progressBar"></div></div>
+      </div>
+      <div id="jobNotice" class="job-notice"></div>
+      <div class="row">
+        <button id="retryJobBtn" disabled>重试任务</button>
+        <button id="cancelJobBtn" disabled>取消任务</button>
+        <button id="openJobOutputBtn" disabled>打开任务输出</button>
+      </div>
+      <pre id="logShell" class="log-shell"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>结果库</h2>
+      <div class="row">
+        <button id="refreshResultsBtn">手动刷新结果</button>
+      </div>
+      <div class="split">
+        <div id="resultList" class="list"></div>
+        <div id="resultDetail" class="detail">请选择一条结果查看详情</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>使用说明</h2>
+      <div id="guideSections" class="guide-grid"></div>
+    </section>
+  </main>
+
+  <div id="toastStack" class="toast-stack"></div>
+  <script type="module" src="/static/app.js?v=dark-20260603"></script>
+</body>
+</html>

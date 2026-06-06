@@ -1,0 +1,15 @@
+.venv/
+.cache/
+.playwright-cli/
+outputs/
+asr_output/
+models/
+inputs/
+nul
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+Thumbs.db

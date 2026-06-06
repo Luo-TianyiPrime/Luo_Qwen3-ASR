@@ -1,0 +1,19 @@
+{
+  "audio": "D:\\训练集\\音频_乐正绫",
+  "output_mode": "auto",
+  "output_dir": "",
+  "dataset_format": "standard",
+  "ref_audio": "",
+  "asr_ckpt": ".\\models\\Qwen3-ASR-1.7B",
+  "aligner_ckpt": ".\\models\\Qwen3-ForcedAligner-0.6B",
+  "language": "Chinese",
+  "punc_model": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+  "batch_size": 1,
+  "pause_threshold": 0.6,
+  "min_dur": 0.8,
+  "max_dur": 8.0,
+  "pad_left": 0.05,
+  "pad_right": 0.1,
+  "eta_rtf": 2.0,
+  "scan_subfolders": false
+}
