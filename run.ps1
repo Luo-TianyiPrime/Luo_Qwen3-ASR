@@ -472,12 +472,41 @@ if (-not (Test-Path -LiteralPath $ScriptPath)) {
     throw (New-ActionableError -Problem "未找到主脚本。" -Cause "通常是项目文件不完整，或者当前目录不是 Qwen3-ASR 根目录。" -NextStep "请确认当前就在项目根目录，必要时重新解压完整项目后再试。")
 }
 
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-    throw (New-ActionableError -Problem "未找到 ffmpeg。" -Cause "音频转码和提取时长依赖 ffmpeg / ffprobe，最常见原因是还没安装，或者装了但没有加入 PATH。" -NextStep "先安装 ffmpeg，并确认命令行里能直接运行 `ffmpeg -version`，然后重新执行 `./run.ps1`。")
-}
+# 检查 ffmpeg / ffprobe。
+# env.ps1 在脚本启动阶段已加载，所以如果 .tools\ffmpeg\bin 里有 ffmpeg.exe，Get-Command 就能找到。
+# 如果 PATH 中找不到，就会尝试调用 bootstrap.ps1 自动下载便携版 ffmpeg 到项目内目录。
+$ffmpegMissing = -not (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+$ffprobeMissing = -not (Get-Command ffprobe -ErrorAction SilentlyContinue)
 
-if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-    throw (New-ActionableError -Problem "未找到 ffprobe。" -Cause "ffprobe 通常和 ffmpeg 一起提供，常见原因是 ffmpeg 没装完整，或者 PATH 没生效。" -NextStep "先修好 ffmpeg 安装，再重新运行 `./run.ps1`。")
+if ($ffmpegMissing -or $ffprobeMissing) {
+    Write-Host "[run] ffmpeg / ffprobe 在当前 PATH 中缺失，准备项目内自动安装。"
+    Write-Host "[run] 说明：ffmpeg 负责音频转码和提取时长，是语音识别流程的必需工具。"
+    Write-Host "[run] 安装位置：.tools\ffmpeg（约 80 MB），只在当前项目内生效，不会修改你电脑的系统 PATH。"
+
+    $bootstrapScript = Join-Path $ProjectRoot "bootstrap.ps1"
+    if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) {
+        throw (New-ActionableError -Problem "自动安装 ffmpeg 失败：未找到 bootstrap.ps1。" -Cause "项目文件可能不完整，缺少环境初始化脚本。" -NextStep "请重新解压或重新拉取完整项目，确保 bootstrap.ps1 存在。")
+    }
+
+    # 以子进程方式调用 bootstrap.ps1，避免错误传播影响当前脚本的控制流。
+    # 注意：bootstrap.ps1 内部也设置了 $ErrorActionPreference="Stop" 和 try/catch，
+    # 即使下载失败也会优雅退出，所以这里不需要额外的 try/catch。
+    Write-Host "[run] 正在调用 bootstrap.ps1 -InstallFfmpegOnly（下载可能需要几十秒到几分钟）..."
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript -InstallFfmpegOnly
+
+    # 重新加载 env.ps1，让当前进程的 PATH 包含刚安装的 .tools\ffmpeg\bin
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot "env.ps1")) {
+        . (Join-Path $ProjectRoot "env.ps1")
+    }
+
+    # 再次检查
+    if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+        throw (New-ActionableError -Problem "未找到 ffmpeg。自动安装后 PATH 中仍未找到。" -Cause "通常是因为自动下载失败（如网络问题），或 .tools\ffmpeg\bin 目录中的文件不完整。" -NextStep "你可以手动从 https://www.gyan.dev/ffmpeg/builds/ 下载 Windows 版 ffmpeg，解压到 .tools\ffmpeg 目录；或再次运行 .\\run.ps1 自动重试。")
+    }
+
+    if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+        throw (New-ActionableError -Problem "未找到 ffprobe。ffmpeg 已可用但 ffprobe 缺失。" -Cause "ffprobe 通常和 ffmpeg 一起打包，解压不完整可能导致后者缺失。" -NextStep "请检查 .tools\ffmpeg\bin 目录下是否存在 ffprobe.exe，如缺失请重新解压或重新运行 .\\run.ps1。")
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Config.Audio)) {

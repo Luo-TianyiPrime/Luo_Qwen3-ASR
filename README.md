@@ -15,34 +15,26 @@
 1. 第一次使用先准备环境
    - Python 版本至少 `3.10`
     - `.venv` 可以理解成“项目专用的 Python 小房间”，不用你手动创建，`bootstrap.bat` 会帮你处理
-   - `ffmpeg` 必须已安装，而且命令行里能直接运行 `ffmpeg -version`
+   - `ffmpeg`：项目会自动检测，如果电脑上没有会自动下载到项目内目录（`.tools\ffmpeg`），不需要你手动装
     - 如果你还没有初始化环境，先运行一次 `.\bootstrap.bat`
    - 第一次安装可能会比较慢，因为要下载 PyTorch、核心依赖，必要时还会下载模型
 
 2. 双击 `run_webui.bat`
    - 这是给小白准备的最简单入口
+   - 首次运行如果检测到缺少 ffmpeg，会自动下载（约 80 MB），请耐心等待
    - 如果你已经在 PowerShell 里，也可以运行 `.\start_webui.ps1`
 
 3. 浏览器会自动打开 `http://127.0.0.1:8765`
    - 把要处理的音频放进 `.\inputs` 文件夹
    - 如果没有自动打开，就手动复制这个地址
    - 如果提示端口被占用，改用 `.\start_webui.ps1 -Port 8766`
-   - WebUI 首屏会先做环境检查：如果某项是红色，直接按提示点“安装基础依赖”“下载模型”或“打开输入目录”即可
+   - WebUI 首屏会先做环境检查：如果某项是红色，直接按提示点"安装基础依赖""下载模型"或"打开输入目录"即可
 
 小白第一次最容易卡住的 3 个地方：
 
 - Python 太旧：请装 Python `3.10` 及以上
-- `ffmpeg` 没装或没加到 `PATH`：先装好再跑
+- 网络不稳定导致下载失败：重新运行一次通常就能恢复；Pip/Conda 镜像慢可以参考后面的『镜像源排错』章节
 - 还没执行 `.\bootstrap.bat`：先把 `.venv` 和依赖装出来
-
-Windows 安装 `ffmpeg` 的最简单办法：
-
-1. 下载 Windows 版 `ffmpeg`
-2. 解压到一个固定目录，例如 `C:\ffmpeg`
-3. 把 `C:\ffmpeg\bin` 加到 `PATH`
-4. 重新打开 PowerShell，执行 `ffmpeg -version` 和 `ffprobe -version`
-
-`PATH` 可以理解成“系统找命令的名单”。如果没加进去，脚本就会提示 `ffmpeg / ffprobe not found`，音频转码这一步会直接失败。
 
 如果你更想看命令行，直接往下跳到第 5 节；如果你更想先理解原理，继续看第 2 节。
 
@@ -1024,7 +1016,7 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 
 最常见原因：你还没运行过 `bootstrap.bat`，或者上次安装中断了。
 
-你现在该怎么做：先运行 `bootstrap.bat`；如果还是失败，回到前面的安装前提，先确认 Python 和 `ffmpeg` 都正常。
+你现在该怎么做：先运行 `bootstrap.bat`；如果还是失败，回到前面的安装前提，先确认 Python 正常（ffmpeg 项目会自动安装，不需要手动处理）。
 
 ### 12.2 输入路径不存在
 
@@ -1038,9 +1030,13 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 
 现象：自检或处理时提示 `ffmpeg` / `ffprobe` 找不到。
 
-最常见原因：没安装 `ffmpeg`，或者装了但没加到 `PATH`。
+最常见原因：自动下载 ffmpeg 时网络中断，或下载完但解压不完整。
 
-你现在该怎么做：重新打开 PowerShell，执行 `ffmpeg -version` 和 `ffprobe -version`；如果还是不行，就回到前面的 ffmpeg 安装步骤。
+你现在该怎么做：
+- 检查 `.tools\ffmpeg\bin` 目录里有没有 `ffmpeg.exe` 和 `ffprobe.exe`
+- 如果没有，重新运行 `.\bootstrap.bat` 或 `.\start_webui.ps1`，项目会自动重试下载
+- 也可以手动从 https://www.gyan.dev/ffmpeg/builds/ 下载 `ffmpeg-release-essentials.zip`，解压后将整个解压目录的内容放入 `.tools\ffmpeg`（确保 `.tools\ffmpeg\bin\ffmpeg.exe` 存在即可）
+- 如果系统 PATH 里已经有 ffmpeg，项目会优先使用系统版本，不需要额外操作
 
 ### 12.4 模型加载失败
 

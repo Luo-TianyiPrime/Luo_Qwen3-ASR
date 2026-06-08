@@ -6,6 +6,8 @@
     [switch]$DownloadModels,
     [switch]$DownloadAsrModel,
     [switch]$DownloadAlignerModel,
+    [switch]$InstallFfmpegOnly,
+    [switch]$SkipFfmpegInstall,
     [ValidateSet("hf", "modelscope")]
     [string]$ModelHub = "hf",
     [string]$AsrCkpt = "Qwen/Qwen3-ASR-1.7B",
@@ -22,6 +24,18 @@ $VenvPip = Join-Path $VenvPath "Scripts\pip.exe"
 $ModelDownloadVenvPath = Join-Path $ProjectRoot ".cache\model_download_venv"
 $ModelDownloadPython = Join-Path $ModelDownloadVenvPath "Scripts\python.exe"
 $RequirementsPath = Join-Path $ProjectRoot "requirements.txt"
+$ToolsRoot = Join-Path $ProjectRoot ".tools"
+$FfmpegRoot = Join-Path $ToolsRoot "ffmpeg"
+$FfmpegBin = Join-Path $FfmpegRoot "bin"
+$DownloadCacheRoot = Join-Path $ProjectRoot ".cache\downloads"
+
+# Windows 版 ffmpeg 的项目内自动安装源。
+# 说明：
+# - 这里使用 gyan.dev 提供的 release essentials 静态构建包，里面包含 ffmpeg.exe 和 ffprobe.exe。
+# - “静态构建”可以理解为：运行所需的大部分组件已经一起打包好，不需要额外安装一堆 DLL。
+# - 本脚本只把它解压到 .tools\ffmpeg，不写入系统目录，也不永久修改系统 PATH。
+# - 如果以后你想换下载源，只需要改这个 URL；其它安装逻辑不需要动。
+$FfmpegDownloadUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 if (Test-Path (Join-Path $ProjectRoot "env.ps1")) {
     . (Join-Path $ProjectRoot "env.ps1")
@@ -84,6 +98,184 @@ function Write-BootstrapFailure {
             Write-Host "[bootstrap] 下一步：先看上面最后几行报错。若是网络问题，重试通常就能恢复；若是 Python 相关问题，先确认 Python 3.10+ 可用。"
         }
     }
+}
+
+function Test-FfmpegCommands {
+    # 同时检查 ffmpeg 和 ffprobe。
+    # ffmpeg 负责转码、截取、导出音频；ffprobe 负责读取音频时长、编码等元信息。
+    # 只找到其中一个都不算完整可用，因为后续音频处理链路两者都会用到。
+    $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
+    return [bool]($ffmpeg -and $ffprobe)
+}
+
+function Add-ProjectFfmpegToProcessPath {
+    # 把项目内 ffmpeg 加入当前 PowerShell 进程的 PATH。
+    # 注意：子进程无法反向修改父进程 PATH，所以 start_webui.ps1 调用本脚本安装完后，
+    # 还会重新加载 env.ps1，让 WebUI 那个父进程也能立刻找到 ffmpeg。
+    if (
+        (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffmpeg.exe") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffprobe.exe") -PathType Leaf)
+    ) {
+        $pathItems = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($pathItems -notcontains $FfmpegBin) {
+            $env:PATH = ($FfmpegBin + ";" + $env:PATH)
+        }
+    }
+}
+
+function Test-ProjectFfmpeg {
+    return [bool](
+        (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffmpeg.exe") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffprobe.exe") -PathType Leaf)
+    )
+}
+
+function Assert-PathUnderProject {
+    param([string]$Path)
+
+    # 这是删除临时目录 / 旧工具目录前的安全检查。
+    # 只有目标路径明确位于当前项目目录之内，才允许递归删除，避免路径变量异常时误删系统目录。
+    $projectFull = [System.IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
+    $targetFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (-not $targetFull.StartsWith($projectFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "安全检查失败：拒绝操作项目目录外的路径：$targetFull"
+    }
+}
+
+function Test-FileSha256 {
+    param(
+        [string]$FilePath,
+        [string]$ExpectedHash
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedHash)) {
+        return $true
+    }
+
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $FilePath).Hash.ToLowerInvariant()
+    return ($actual -eq $ExpectedHash.Trim().ToLowerInvariant())
+}
+
+function Get-RemoteSha256OrEmpty {
+    param([string]$Sha256Url)
+
+    try {
+        # 有些下载站会提供 .sha256 文件。能拿到就校验，拿不到不阻断安装。
+        # 原因是这里的主要目标是“新手一键跑通”；完整供应链安全还可以后续用固定版本+固定哈希进一步增强。
+        $text = (Invoke-WebRequest -Uri $Sha256Url -UseBasicParsing -TimeoutSec 30).Content
+        $match = [regex]::Match([string]$text, '(?i)[a-f0-9]{64}')
+        if ($match.Success) {
+            return $match.Value
+        }
+    }
+    catch {
+        Write-Warning "未能获取 ffmpeg SHA256 校验文件，将继续下载但跳过哈希校验。详情：$($_.Exception.Message)"
+    }
+
+    return ""
+}
+
+function Install-ProjectFfmpeg {
+    # 项目内安装 ffmpeg 的完整流程：
+    # 1. 如果系统或项目里已经能找到 ffmpeg/ffprobe，直接复用，不重复下载。
+    # 2. 如果找不到，就下载 Windows 静态构建 zip。
+    # 3. 解压到 .tools\ffmpeg。
+    # 4. 把 .tools\ffmpeg\bin 加入当前进程 PATH，并做最终命令检查。
+    Add-ProjectFfmpegToProcessPath
+
+    if (Test-FfmpegCommands) {
+        Write-Host "[bootstrap] ffmpeg / ffprobe 已可用，跳过自动安装。"
+        return
+    }
+
+    if (Test-ProjectFfmpeg) {
+        Add-ProjectFfmpegToProcessPath
+        if (Test-FfmpegCommands) {
+            Write-Host "[bootstrap] 已启用项目内 ffmpeg：$FfmpegBin"
+            return
+        }
+    }
+
+    Write-Host "[bootstrap] 当前找不到 ffmpeg / ffprobe，开始项目内自动安装。"
+    Write-Host "[bootstrap] 安装位置：$FfmpegRoot"
+    Write-Host "[bootstrap] 下载地址：$FfmpegDownloadUrl"
+
+    New-Item -ItemType Directory -Force -Path $ToolsRoot, $DownloadCacheRoot | Out-Null
+
+    $zipPath = Join-Path $DownloadCacheRoot "ffmpeg-release-essentials.zip"
+    $extractRoot = Join-Path $DownloadCacheRoot "ffmpeg_extract"
+
+    if (Test-Path -LiteralPath $extractRoot) {
+        Assert-PathUnderProject -Path $extractRoot
+        Remove-Item -LiteralPath $extractRoot -Recurse -Force
+    }
+
+    $expectedHash = Get-RemoteSha256OrEmpty -Sha256Url ($FfmpegDownloadUrl + ".sha256")
+
+    $shouldDownload = $true
+    if (Test-Path -LiteralPath $zipPath -PathType Leaf) {
+        if (Test-FileSha256 -FilePath $zipPath -ExpectedHash $expectedHash) {
+            Write-Host "[bootstrap] 复用已下载的 ffmpeg 压缩包：$zipPath"
+            $shouldDownload = $false
+        }
+        else {
+            Write-Warning "本地 ffmpeg 压缩包哈希不匹配，将重新下载。"
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+    }
+
+    if ($shouldDownload) {
+        # PowerShell 5.1 在部分老系统上默认 TLS 设置偏旧，这里显式启用 TLS 1.2，减少 HTTPS 下载失败概率。
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $FfmpegDownloadUrl -OutFile $zipPath -UseBasicParsing
+        if (-not (Test-FileSha256 -FilePath $zipPath -ExpectedHash $expectedHash)) {
+            throw "ffmpeg 压缩包 SHA256 校验失败。请删除 $zipPath 后重试，或检查网络代理是否篡改下载内容。"
+        }
+    }
+
+    New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+
+    $ffmpegExe = Get-ChildItem -Path $extractRoot -Recurse -Filter "ffmpeg.exe" -File |
+        Where-Object { $_.DirectoryName -like "*\bin" } |
+        Select-Object -First 1
+    if (-not $ffmpegExe) {
+        throw "ffmpeg 压缩包解压后没有找到 bin\ffmpeg.exe，下载包结构可能已变化。"
+    }
+
+    $sourceBin = $ffmpegExe.Directory.FullName
+    $sourceRoot = Split-Path -Parent $sourceBin
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceBin "ffprobe.exe") -PathType Leaf)) {
+        throw "ffmpeg 压缩包里没有找到 bin\ffprobe.exe，无法满足音频探测需求。"
+    }
+
+    if (Test-Path -LiteralPath $FfmpegRoot) {
+        Assert-PathUnderProject -Path $FfmpegRoot
+        Remove-Item -LiteralPath $FfmpegRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $FfmpegRoot | Out-Null
+    Copy-Item -Path (Join-Path $sourceRoot "*") -Destination $FfmpegRoot -Recurse -Force
+
+    Add-ProjectFfmpegToProcessPath
+    if (-not (Test-FfmpegCommands)) {
+        throw "ffmpeg 已解压，但当前进程仍找不到 ffmpeg / ffprobe。请检查项目路径和权限。"
+    }
+
+    Write-Host "[bootstrap] ffmpeg 自动安装完成：$FfmpegBin"
+}
+
+function Invoke-FfmpegOnlyMode {
+    param([switch]$InstallFfmpegOnly)
+
+    if (-not $InstallFfmpegOnly) {
+        return $false
+    }
+
+    Write-Host "[bootstrap] 进入 ffmpeg 安装模式：只安装 / 修复项目内 ffmpeg，不安装 Python 依赖。"
+    Install-ProjectFfmpeg
+    Write-Host "[bootstrap] 完成。"
+    return $true
 }
 
 function Install-Torch {
@@ -246,11 +438,24 @@ function Invoke-ModelDownloadMode {
 }
 
 try {
+    if (Invoke-FfmpegOnlyMode -InstallFfmpegOnly:$InstallFfmpegOnly) {
+        exit 0
+    }
+
     if (Invoke-ModelDownloadMode -DownloadModels:$DownloadModels -DownloadAsrModel:$DownloadAsrModel -DownloadAlignerModel:$DownloadAlignerModel -Hub $ModelHub) {
         exit 0
     }
 
     Write-Host "[bootstrap] 首次安装可能会比较久，因为要下载 PyTorch 和核心依赖。"
+
+    if (-not $SkipFfmpegInstall) {
+        Invoke-Step "检查 / 自动安装 ffmpeg" {
+            Install-ProjectFfmpeg
+        }
+    }
+    else {
+        Write-Host "[bootstrap] 已收到 -SkipFfmpegInstall，跳过 ffmpeg 自动安装。"
+    }
 
     Invoke-Step "检查 Python 3.10+：$PythonExe" {
         $pythonVersion = Get-PythonVersion -Exe $PythonExe

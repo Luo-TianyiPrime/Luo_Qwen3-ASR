@@ -22,6 +22,9 @@ Qwen3-ASR WebUI 总启动脚本。
 
 .EXAMPLE
 .\start_webui.ps1 -OnlyCheck
+
+.EXAMPLE
+.\start_webui.ps1 -SkipFfmpegInstall
 #>
 
 param(
@@ -74,7 +77,13 @@ param(
 
     # OnlyCheck 表示只做启动前检测和必要修复，不真正启动 WebUI。
     # 适合排查环境问题，也适合测试自动安装/自动下载逻辑。
-    [switch]$OnlyCheck
+    [switch]$OnlyCheck,
+
+    # SkipFfmpegInstall 表示跳过 ffmpeg 自动安装。
+    # 默认不加这个参数：启动 WebUI 前如果检测到系统没有 ffmpeg，会自动下载便携版到
+    # .tools\ffmpeg，不需要你手动下载解压，也不会改动系统 PATH。
+    # 加上这个参数：只检测不安装，适合你已经手动装了 ffmpeg 或者暂时不想联网下载。
+    [switch]$SkipFfmpegInstall
 )
 
 Set-StrictMode -Version Latest
@@ -452,19 +461,95 @@ function Ensure-DefaultModels {
     }
 }
 
-function Test-FfmpegTools {
-    $ffmpegPath = (Get-Command ffmpeg -ErrorAction SilentlyContinue)
-    $ffprobePath = (Get-Command ffprobe -ErrorAction SilentlyContinue)
+function Ensure-FfmpegTools {
+    param(
+        [string]$BootstrapScriptPath,
+        [string]$EnvScriptPath,
+        [bool]$SkipFfmpegInstallValue
+    )
 
-    if (-not $ffmpegPath) {
-        Write-Warning "当前命令行找不到 ffmpeg。WebUI 可以打开，但提交音频任务时大概率会失败。"
-        Write-Host "[下一步] 请安装 ffmpeg，并确认新打开的命令行能运行：ffmpeg -version"
+    # env.ps1 在脚本启动阶段已经加载过，它会把项目内 .tools\ffmpeg\bin 加入当前进程 PATH。
+    # 所以如果系统或项目本地已经有 ffmpeg，到这里时 Get-Command 就能找到。
+    $ffmpegFound = $null -ne (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    $ffprobeFound = $null -ne (Get-Command ffprobe -ErrorAction SilentlyContinue)
+
+    if ($ffmpegFound -and $ffprobeFound) {
+        Write-Host "[检测] ffmpeg / ffprobe 已可用。"
+        return
     }
 
-    if (-not $ffprobePath) {
-        Write-Warning "当前命令行找不到 ffprobe。ffprobe 通常和 ffmpeg 在同一个 bin 目录里。"
-        Write-Host "[下一步] 请安装 ffmpeg，并把 ffmpeg 的 bin 目录加入 PATH。"
+    # 走到这里说明 ffmpeg 和 ffprobe 至少缺一个。
+    # 常见情况：新 clone 的项目，.tools\ffmpeg 还是空的。
+    if ($SkipFfmpegInstallValue) {
+        Write-Host "[跳过] 已设置跳过 ffmpeg 自动安装。"
+        if (-not $ffmpegFound) {
+            Write-Warning "当前命令行找不到 ffmpeg。WebUI 可以打开，但提交音频任务时大概率会失败。"
+        }
+        if (-not $ffprobeFound) {
+            Write-Warning "当前命令行找不到 ffprobe。ffprobe 通常和 ffmpeg 在同一个 bin 目录里。"
+        }
+        Write-Host "[下一步] 请安装 ffmpeg，并确认命令行能运行 ffmpeg -version；或者重新启动 WebUI（不加 -SkipFfmpegInstall）让项目自动安装。"
+        return
     }
+
+    Write-Host "[检测] ffmpeg / ffprobe 在当前 PATH 中缺失，准备项目内自动安装。"
+    Write-Host "[说明] ffmpeg 是音频转码和时长提取的必需工具。"
+    Write-Host "[说明] 项目会自动下载便携版 ffmpeg 到 .tools\ffmpeg（约 80 MB），约需几十秒到几分钟，取决于网速。"
+    Write-Host "[说明] 安装位置只在当前项目内，不需要管理员权限，也不会修改你电脑的系统 PATH。"
+
+    # 检查 bootstrap.ps1 是否存在（里面包含完整的下载/解压/校验逻辑）
+    if (-not (Test-Path -LiteralPath $BootstrapScriptPath -PathType Leaf)) {
+        Write-Warning "未找到 bootstrap.ps1，无法自动安装 ffmpeg。"
+        Write-Warning "请确认项目文件完整，然后手动安装 ffmpeg。"
+        return
+    }
+
+    # 调用 bootstrap.ps1 的 -InstallFfmpegOnly 模式：
+    # - 如果系统 PATH 已有 ffmpeg：直接复用，不重复下载
+    # - 如果 .tools\ffmpeg 已有：启用目录，不重复下载
+    # - 如果都没有：下载 → 解压 → 校验 → 放入 .tools\ffmpeg → 加入当前进程 PATH
+    Write-Host "[安装] 正在调用 bootstrap.ps1 -InstallFfmpegOnly ..."
+    $oldErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScriptPath -InstallFfmpegOnly
+        $installExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldErrorAction
+    }
+
+    # 无论 bootstrap.ps1 是否成功，都重新加载 env.ps1，让当前进程 PATH 包含可能新安装的 .tools\ffmpeg\bin
+    if (Test-Path -LiteralPath $EnvScriptPath -PathType Leaf) {
+        . $EnvScriptPath
+    }
+
+    # 再次检查
+    $ffmpegFound = $null -ne (Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    $ffprobeFound = $null -ne (Get-Command ffprobe -ErrorAction SilentlyContinue)
+
+    if ($ffmpegFound -and $ffprobeFound) {
+        Write-Host "[检测] ffmpeg 自动安装完成，已可用。"
+        return
+    }
+
+    # 安装失败时的友好提示
+    Write-Warning "ffmpeg 自动安装未成功。"
+    if ($installExit -ne 0) {
+        Write-Warning "bootstrap.ps1 退出码：$installExit。请查看上方的错误日志。"
+    }
+    if (-not $ffmpegFound) {
+        Write-Warning "当前命令行找不到 ffmpeg。"
+    }
+    if (-not $ffprobeFound) {
+        Write-Warning "当前命令行找不到 ffprobe。"
+    }
+    Write-Host "[下一步] 你可以手动安装 ffmpeg："
+    Write-Host "  1. 打开浏览器访问 https://www.gyan.dev/ffmpeg/builds/"
+    Write-Host "  2. 下载 ffmpeg-release-essentials.zip"
+    Write-Host "  3. 解压后把 bin 目录（里面有 ffmpeg.exe）的路径加入系统 PATH"
+    Write-Host "  4. 重新打开命令行，确认 ffmpeg -version 能正常输出"
+    Write-Host "  或者再次运行 .\\start_webui.ps1 自动重试。"
 }
 
 $ProjectRoot = Resolve-ProjectRoot
@@ -492,6 +577,7 @@ if (Test-Path -LiteralPath $EnvScript -PathType Leaf) {
 # QWEN3_ASR_INSTALL_FUNASR=1     初始化时额外升级/修复 FunASR；旧环境缺标点依赖时可用
 # QWEN3_ASR_RUN_FULL_SELF_CHECK=1 启动前运行完整自检
 # QWEN3_ASR_ONLY_CHECK=1         只检查和修复，不启动 WebUI
+# QWEN3_ASR_SKIP_FFMPEG_INSTALL=1 跳过 ffmpeg 自动安装；适合已手动装好 ffmpeg 的情况
 $autoBootstrap = Get-ConfigBool -Name "QWEN3_ASR_AUTO_BOOTSTRAP" -DefaultValue $true
 $autoDownloadModels = Get-ConfigBool -Name "QWEN3_ASR_AUTO_DOWNLOAD_MODELS" -DefaultValue $true
 $TorchVariant = Get-ConfigChoice -Name "QWEN3_ASR_TORCH_VARIANT" -CurrentValue $TorchVariant -AllowedValues @("auto", "cpu", "cu121", "cu124")
@@ -499,12 +585,16 @@ $ModelHub = Get-ConfigChoice -Name "QWEN3_ASR_MODEL_HUB" -CurrentValue $ModelHub
 $installFunASRValue = [bool]$InstallFunASR -or (Get-ConfigBool -Name "QWEN3_ASR_INSTALL_FUNASR" -DefaultValue $false)
 $runFullSelfCheckValue = [bool]$RunFullSelfCheck -or (Get-ConfigBool -Name "QWEN3_ASR_RUN_FULL_SELF_CHECK" -DefaultValue $false)
 $onlyCheckValue = [bool]$OnlyCheck -or (Get-ConfigBool -Name "QWEN3_ASR_ONLY_CHECK" -DefaultValue $false)
+$skipFfmpegInstall = [bool]$SkipFfmpegInstall -or (Get-ConfigBool -Name "QWEN3_ASR_SKIP_FFMPEG_INSTALL" -DefaultValue $false)
 
 if ($NoAutoBootstrap) {
     $autoBootstrap = $false
 }
 if ($NoModelDownload) {
     $autoDownloadModels = $false
+}
+if ($SkipFfmpegInstall) {
+    $skipFfmpegInstall = $true
 }
 
 $BrowserHost = Get-BrowserHost -HostName $BindHost
@@ -517,6 +607,7 @@ Write-Host "[状态] 项目根目录：$ProjectRoot"
 Write-Host "[状态] Python：$ProjectPython"
 Write-Host "[状态] 自动安装基础依赖：$autoBootstrap"
 Write-Host "[状态] 自动下载默认模型：$autoDownloadModels"
+Write-Host "[状态] 跳过 ffmpeg 自动安装：$skipFfmpegInstall"
 Write-Host "[状态] PyTorch 安装策略：$TorchVariant"
 Write-Host "[状态] 模型下载来源：$ModelHub"
 
@@ -545,7 +636,7 @@ if ($health -and $health.status -eq "ok") {
 }
 
 Ensure-CoreEnvironment -PythonPath $ProjectPython -BootstrapScriptPath $BootstrapScript -AutoBootstrapValue $autoBootstrap -TorchVariantValue $TorchVariant -InstallFunASRValue $installFunASRValue
-Test-FfmpegTools
+Ensure-FfmpegTools -BootstrapScriptPath $BootstrapScript -EnvScriptPath $EnvScript -SkipFfmpegInstallValue $skipFfmpegInstall
 Ensure-DefaultModels -ProjectRootPath $ProjectRoot -BootstrapScriptPath $BootstrapScript -AutoDownloadModelsValue $autoDownloadModels -ModelHubValue $ModelHub
 
 if ($runFullSelfCheckValue) {
