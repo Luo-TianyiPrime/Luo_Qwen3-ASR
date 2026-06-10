@@ -374,8 +374,8 @@ outputs\run_YYYYMMDD_HHMMSS
 ├─ _tmp
 │  └─ input_16k_mono.wav
 ├─ segments
-│  ├─ 某一句话.wav
-│  ├─ 某一句话.txt
+│  ├─ seg_0001__某一句话.wav
+│  ├─ seg_0001__某一句话.txt
 │  └─ ...
 ├─ data                          # 仅在 Qwen3-TTS 模式下生成
 │  ├─ audio
@@ -785,6 +785,15 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 
 每个文件代表一句话或一个切分片段。
 
+文件名现在固定带有 `seg_0001` 这种序号前缀。  
+这个序号是片段的稳定主键，也等于音频里的时间顺序。
+
+为什么不直接把整句文字当文件名：
+
+- Windows 资源管理器按“名称”排序时，纯中文句子会按文本顺序排，不是按音频时间排
+- 长文件名会被资源管理器截断，看起来很像“文件名和内容对不上”
+- 序号前缀能保证 `.wav`、`.txt`、`index.jsonl` 三处更容易互相核对
+
 ### 9.3 `segments\*.txt`
 
 这是对应音频片段的文本内容。
@@ -826,7 +835,7 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 每一行大致长这样：
 
 ```json
-{"id":"seg_0001","wav":"segments/第一句.wav","txt":"segments/第一句.txt","start":0.52,"end":2.14,"text":"大家好，欢迎来到这里。"}
+{"id":"seg_0001","wav":"segments/seg_0001__大家好，欢迎来到这里.wav","txt":"segments/seg_0001__大家好，欢迎来到这里.txt","start":0.52,"end":2.14,"text":"大家好，欢迎来到这里。"}
 ```
 
 字段解释：

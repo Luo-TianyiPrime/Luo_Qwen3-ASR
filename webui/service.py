@@ -236,6 +236,8 @@ def probe_audio_duration_seconds(audio_path: Path, timeout: int = 10) -> float |
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=True,
         )
@@ -389,16 +391,16 @@ class JobManager:
             "label": "热词库（长期保存）",
             "type": "select",
             "options": [{"value": "", "label": "不使用"}],
-            "description": "选择已保存的专有名词词表",
-            "long_help": "适合长期复用的品牌词、人名、项目名。临时热词会优先覆盖这里的内容。",
+            "description": "选择已保存的专有名词词表，选中后会自动加载到下方热词编辑区",
+            "long_help": "长期复用的品牌词、人名、项目名词表。选中后下方临时热词区会显示库内容，可直接编辑并通过「保存到热词库」按钮写回。",
         },
         {
             "group": "models",
             "key": "hotword_text",
-            "label": "临时热词（当前任务）",
+            "label": "热词内容编辑（当前任务使用）",
             "type": "text",
-            "description": "多行输入，每行一个词或短语",
-            "long_help": "只影响当前任务；如果和热词库重复，临时热词优先，不需要你理解内部覆盖规则。",
+            "description": "每行一个词或短语。选中热词库后自动加载库内容，可在此直接编辑。",
+            "long_help": "提交任务时这里的内容就是任务实际使用的热词。选中热词库后编辑完记得点击「保存到热词库」写回库文件。",
         },
         {
             "group": "split",
@@ -1428,7 +1430,9 @@ class JobManager:
                     if not line:
                         continue
                     payload = json.loads(line)
-                    row = {"audio": payload.get("audio", ""), "text": payload.get("text", "")}
+                    # index.jsonl 是标准分段索引，音频字段名叫 wav；
+                    # qwen3_tts.jsonl 才使用 audio 字段。这里两个都兼容，避免从旧结果二次导出时音频路径为空。
+                    row = {"audio": payload.get("audio") or payload.get("wav", ""), "text": payload.get("text", "")}
                     if ref_audio:
                         row["ref_audio"] = str(ref_audio)
                     out.write(json.dumps(row, ensure_ascii=False) + "\n")

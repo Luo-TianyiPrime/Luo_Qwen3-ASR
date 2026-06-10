@@ -25,7 +25,7 @@ import soundfile as sf
 
 
 # 贪心分句使用的边界集合。
-STRONG_BOUNDARIES = {"。", "！", "？", "?", "!"}
+STRONG_BOUNDARIES = {"。", "！", "？", "?", "!", "."}
 SOFT_BOUNDARIES = {"，", ",", "；", ";"}
 COMMON_PUNCTS = STRONG_BOUNDARIES | SOFT_BOUNDARIES | {
     "：",
@@ -43,10 +43,27 @@ COMMON_PUNCTS = STRONG_BOUNDARIES | SOFT_BOUNDARIES | {
     ")",
     "【",
     "】",
+    "[",
+    "]",
     "<",
     ">",
     "—",
     "-",
+}
+
+# 标点清理映射表：
+# - 左边是常见的半角英文标点，右边是中文语音转写里更自然的全角标点。
+# - 这里只做“标点符号形态”的规范化，不改任何汉字、英文或数字。
+# - 这样可以避免出现中英文标点混排导致的 `，,`、`?.` 这类看起来很怪的结果。
+PUNCT_NORMALIZE_MAP = {
+    ",": "，",
+    ";": "；",
+    "?": "？",
+    "!": "！",
+    ".": "。",
+    ":": "：",
+    "(": "（",
+    ")": "）",
 }
 
 DEFAULT_SPLIT_DEFAULTS: dict[str, float] = {
@@ -107,6 +124,25 @@ def safe_filename_from_text(text: str, max_len: int = 80) -> str:
         if not cleaned:
             cleaned = "segment"
     return cleaned
+
+
+def segment_basename(idx: int, text: str, max_preview_len: int = 48) -> str:
+    """
+    生成稳定、可排序、可追踪的分段文件名主体。
+
+    为什么不再直接把整句识别文本当文件名：
+    1. Windows 资源管理器默认按文件名排序，纯文本文件名会按汉字拼音/字符顺序排，
+       不是按音频时间顺序排，用户很容易误以为 wav 和 txt 错位。
+    2. 长句会被资源管理器截断显示，多个文件看起来像同一个名字，排查非常困难。
+    3. 文本里如果刚好有奇怪标点，文件名也会跟着变得很难看。
+
+    所以文件名固定为：
+      seg_0001__文本预览.wav
+      seg_0001__文本预览.txt
+    其中 `seg_0001` 是真正的稳定主键，后面的中文只是方便肉眼快速识别。
+    """
+    preview = safe_filename_from_text(text, max_len=max_preview_len)
+    return f"seg_{idx:04d}__{preview}"
 
 
 def to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -211,6 +247,8 @@ def ffmpeg_convert_to_wav16k_mono(src_audio: Path, dst_wav: Path) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
         _ = proc.stdout
@@ -248,6 +286,8 @@ def probe_audio_stream_info(src_audio: Path) -> Tuple[int, int]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except FileNotFoundError as exc:
@@ -310,6 +350,8 @@ def ffmpeg_export_segment_from_source(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except FileNotFoundError as exc:
@@ -537,6 +579,86 @@ def extract_text_from_punc_result(obj: Any) -> Optional[str]:
     return None
 
 
+def normalize_punctuation_text(text: str) -> str:
+    """
+    只清理“标点表现形式”，不碰正文。
+
+    说明给新手：
+    - ASR 主模型负责“听音频并识别出字”。
+    - 标点模型只应该负责“在已有文字里插入逗号、句号、问号等符号”。
+    - 如果标点模型把字改了，那就不再是标点恢复，而是改写正文，会破坏后续时间线对齐。
+
+    这里做的事情很保守：
+    1. 把常见英文标点换成中文标点，例如 `,` -> `，`。
+    2. 删除标点前后的多余空格，避免出现 `你好 ， 世界`。
+    3. 连续重复的标点只保留一个，避免出现 `，，`、`！！`。
+    4. 不修改汉字、英文、数字本身。
+    """
+    normalized_chars: List[str] = []
+    previous_punct = ""
+
+    for raw_ch in text or "":
+        if raw_ch.isspace():
+            # 中文转写通常不需要空格；保留空格反而会干扰字符级时间线。
+            continue
+
+        ch = PUNCT_NORMALIZE_MAP.get(raw_ch, raw_ch)
+        is_punct = ch in COMMON_PUNCTS
+
+        if is_punct:
+            if normalized_chars and normalized_chars[-1] == ch:
+                # 相同标点连续出现，大概率是标点模型抖动，直接去重。
+                continue
+            if previous_punct and previous_punct in SOFT_BOUNDARIES and ch in STRONG_BOUNDARIES:
+                # `，。`、`，？` 这类组合只保留后面的强标点。
+                normalized_chars.pop()
+            normalized_chars.append(ch)
+            previous_punct = ch
+            continue
+
+        normalized_chars.append(ch)
+        previous_punct = ""
+
+    return "".join(normalized_chars).strip()
+
+
+def text_without_punctuation(text: str) -> str:
+    """
+    去掉空白和标点后保留正文，用来检查标点模型有没有改字。
+
+    举例：
+    - 原文：`大家好欢迎回来`
+    - 合法标点结果：`大家好，欢迎回来。`
+    - 两者去掉标点后都是：`大家好欢迎回来`
+
+    如果去掉标点后正文不一样，说明标点模型不只是加标点，而是改字/漏字/重排。
+    这种结果不能用于切音频，否则文本和 wav 时间段可能对不上。
+    """
+    normalized = normalize_punctuation_text(text)
+    return "".join(ch for ch in normalized if ch not in COMMON_PUNCTS and not ch.isspace())
+
+
+def validate_punctuation_text(raw_text: str, punc_text: str) -> str:
+    """
+    校验标点模型输出是否安全。
+
+    返回值是清理后的标点文本。
+    如果标点模型改动了正文，直接抛错，让主流程回退到 ASR 原始文本。
+    这比“勉强对齐”安全得多，因为错误对齐会导致 txt 写一段、wav 却切另一段。
+    """
+    cleaned = normalize_punctuation_text(punc_text)
+    raw_body = text_without_punctuation(raw_text)
+    punc_body = text_without_punctuation(cleaned)
+
+    if raw_body != punc_body:
+        raise ValueError(
+            "标点模型输出修改了正文，已拒绝使用该标点结果，避免文本和音频错位。"
+            f" 原正文长度={len(raw_body)}，标点后正文长度={len(punc_body)}"
+        )
+
+    return cleaned if cleaned else raw_text
+
+
 def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
     try:
         from funasr import AutoModel
@@ -551,57 +673,50 @@ def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
         model = AutoModel(model=punc_model_name)
     output = model.generate(input=raw_text)
     text = extract_text_from_punc_result(output)
-    return text if text else raw_text
+    return validate_punctuation_text(raw_text, text) if text else raw_text
 
 
 def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: str) -> List[CharStamp]:
     if not raw_timeline:
         return []
 
-    base_chars = [c.char for c in raw_timeline]
     merged: List[CharStamp] = []
     i = 0
 
-    for ch in punc_text:
+    for ch in normalize_punctuation_text(punc_text):
         if ch.isspace():
             continue
 
-        if i < len(base_chars) and ch == base_chars[i]:
-            ref = raw_timeline[i]
-            merged.append(CharStamp(ch, ref.start, ref.end))
-            i += 1
-            continue
-
         if ch in COMMON_PUNCTS:
-            # 标点是新增字符时，把时间点挂到前一个字符尾部，或当前字符起点。
-            if merged:
+            # 标点没有真实语音时长：如果原始时间线当前位置本身也是标点，就复用它的时间；
+            # 否则把新增标点挂到前一个字的结束点。这样不会让标点凭空拉长音频片段。
+            if i < len(raw_timeline) and raw_timeline[i].char in COMMON_PUNCTS:
+                ref = raw_timeline[i]
+                merged.append(CharStamp(ch, ref.start, ref.end))
+                i += 1
+            elif merged:
                 t = merged[-1].end
+                merged.append(CharStamp(ch, t, t))
             elif i < len(raw_timeline):
                 t = raw_timeline[i].start
+                merged.append(CharStamp(ch, t, t))
             else:
-                t = 0.0
-            merged.append(CharStamp(ch, t, t))
+                merged.append(CharStamp(ch, 0.0, 0.0))
             continue
 
-        # 轻量纠偏：向后查找一个短窗口内的匹配字符。
-        matched = False
-        for j in range(i + 1, min(i + 8, len(base_chars))):
-            if base_chars[j] == ch:
-                ref = raw_timeline[j]
-                merged.append(CharStamp(ch, ref.start, ref.end))
-                i = j + 1
-                matched = True
-                break
-        if matched:
-            continue
-
-        if i < len(raw_timeline):
-            ref = raw_timeline[i]
-            merged.append(CharStamp(ch, ref.start, ref.end))
+        # 标点模型通过 validate_punctuation_text() 之后，正文字符顺序必须和原始 ASR 一致。
+        # 因此这里不再做“猜测式纠偏”，否则一旦模型改字，就会把错误文本硬塞到别的时间戳上。
+        while i < len(raw_timeline) and (raw_timeline[i].char in COMMON_PUNCTS or raw_timeline[i].char.isspace()):
             i += 1
-        else:
-            t = merged[-1].end if merged else 0.0
-            merged.append(CharStamp(ch, t, t))
+
+        if i >= len(raw_timeline) or raw_timeline[i].char != ch:
+            raise ValueError(
+                "标点文本无法安全合并到时间线，已拒绝使用该标点结果，避免文本和音频错位。"
+            )
+
+        ref = raw_timeline[i]
+        merged.append(CharStamp(ch, ref.start, ref.end))
+        i += 1
 
     return merged if merged else list(raw_timeline)
 
@@ -725,7 +840,9 @@ def write_segments_and_index(
             if end <= start:
                 continue
 
-            base = safe_filename_from_text(text, max_len=80)
+            # 文件名必须有稳定序号，不能只依赖识别文本。
+            # 这样资源管理器、WebUI、后续数据集脚本按名称排序时，顺序仍然等于音频时间顺序。
+            base = segment_basename(idx, text)
             n = used_name_count.get(base, 0) + 1
             used_name_count[base] = n
             basename = base if n == 1 else f"{base}_{n}"
@@ -747,6 +864,12 @@ def write_segments_and_index(
                 channels=channels,
             )
             txt_out.write_text(text + "\n", encoding="utf-8")
+            written_text = txt_out.read_text(encoding="utf-8", errors="replace").strip()
+            if written_text != text:
+                raise RuntimeError(
+                    f"分段文本写入校验失败：{txt_out}。"
+                    "这表示 index.jsonl 里的文本和实际 txt 文件内容不一致，已停止导出。"
+                )
 
             line = {
                 "id": f"seg_{idx:04d}",

@@ -6,6 +6,15 @@ const state = {
   results: [],
   selectedResultId: null,
   resultDetailCache: {},
+  // ----------------------------------------------------------
+  // 热词库编辑器状态
+  // hotwordLibraryLoaded：当前加载到 textarea 的热词库文件名（如 "Nikki.txt"）
+  //   为 null 表示尚未从热词库加载过内容（可能是手动输入的临时热词）
+  // hotwordLibraryOriginalText：加载热词库时 textarea 的原始内容
+  //   用于比较 textarea 当前值是否被修改（脏数据检测）
+  // ----------------------------------------------------------
+  hotwordLibraryLoaded: null,
+  hotwordLibraryOriginalText: "",
 };
 
 const el = {
@@ -18,6 +27,7 @@ const el = {
   taskTitle: document.getElementById("taskTitle"),
   submitTaskBtn: document.getElementById("submitTaskBtn"),
   saveDefaultsBtn: document.getElementById("saveDefaultsBtn"),
+  saveHotwordBtn: document.getElementById("saveHotwordBtn"),
   openInputsBtn: document.getElementById("openInputsBtn"),
   openProjectBtn: document.getElementById("openProjectBtn"),
   openOutputsBtn: document.getElementById("openOutputsBtn"),
@@ -33,6 +43,11 @@ const el = {
   resultList: document.getElementById("resultList"),
   resultDetail: document.getElementById("resultDetail"),
   toastStack: document.getElementById("toastStack"),
+  // 热词库修改确认对话框相关元素
+  hotwordModal: document.getElementById("hotwordModal"),
+  hotwordModalTitle: document.getElementById("hotwordModalTitle"),
+  hotwordModalBody: document.getElementById("hotwordModalBody"),
+  hotwordModalActions: document.getElementById("hotwordModalActions"),
 };
 
 function escapeHtml(value) {
@@ -243,6 +258,7 @@ function renderField(field) {
   let control = null;
   if (field.type === "select") {
     control = document.createElement("select");
+    control.id = `field-${field.key}`;
     const options = field.options || [];
     for (const option of options) {
       const item = document.createElement("option");
@@ -251,20 +267,36 @@ function renderField(field) {
       if (String(value) === item.value) item.selected = true;
       control.appendChild(item);
     }
-    control.addEventListener("change", (event) => setFormValue(field.key, event.target.value));
+    if (field.key === "hotword_library") {
+      // 热词库下拉框：切换时自动加载库内容到 textarea，并处理未保存修改的提示
+      control.addEventListener("change", async (event) => {
+        const success = await handleHotwordLibraryChange(event.target.value);
+        if (success) {
+          setFormValue(field.key, event.target.value);
+        } else {
+          // 用户取消切换：把下拉框恢复为切换前的值
+          control.value = String(state.form[field.key] ?? "");
+        }
+      });
+    } else {
+      control.addEventListener("change", (event) => setFormValue(field.key, event.target.value));
+    }
   } else if (field.type === "checkbox") {
     control = document.createElement("input");
+    control.id = `field-${field.key}`;
     control.type = "checkbox";
     control.checked = Boolean(value);
     control.addEventListener("change", (event) => setFormValue(field.key, event.target.checked));
   } else if (field.key === "hotword_text") {
     control = document.createElement("textarea");
+    control.id = `field-${field.key}`;
     control.rows = 5;
     control.value = String(value ?? "");
     if (field.placeholder) control.placeholder = field.placeholder;
-    control.addEventListener("change", (event) => setFormValue(field.key, event.target.value));
+    control.addEventListener("input", (event) => setFormValue(field.key, event.target.value));
   } else {
     control = document.createElement("input");
+    control.id = `field-${field.key}`;
     control.type = field.type === "number" ? "number" : "text";
     control.value = String(value ?? "");
     if (field.step !== undefined) control.step = String(field.step);
@@ -290,6 +322,23 @@ function renderField(field) {
   const d2 = document.createElement("small");
   d2.textContent = field.long_help || "";
   wrap.appendChild(d2);
+
+  // 热词编辑区专属：「保存到当前热词库」按钮
+  // 放在 textarea 下方右侧，方便用户在编辑热词后直接保存
+  // 点击后先弹出确认对话框，用户确认后才真正写入热词库 txt 文件
+  // 这样可以避免用户误操作，把临时修改误保存为长期内容
+  if (field.key === "hotword_text") {
+    const actionRow = document.createElement("div");
+    actionRow.className = "field-action-row";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.id = "saveCurrentHotwordBtn";
+    saveBtn.textContent = "保存到当前热词库";
+    saveBtn.addEventListener("click", () => saveToCurrentHotwordLibrary().catch((e) => toast(e.message, "error")));
+    actionRow.appendChild(saveBtn);
+    wrap.appendChild(actionRow);
+  }
+
   return wrap;
 }
 
@@ -566,6 +615,373 @@ async function openSystemPath(target) {
   await request("/api/system/open", { method: "POST", body: JSON.stringify({ target }) });
 }
 
+// ----------------------------------------------------------
+// 热词库编辑器：检查 textarea 是否有未保存修改
+// 比较 textarea 当前值 与 上次从热词库文件加载的原始内容
+// 如果 hotwordLibraryLoaded 为 null（未从热词库加载过），则不算脏数据
+// ----------------------------------------------------------
+function isHotwordDirty() {
+  if (!state.hotwordLibraryLoaded) return false;
+  const textarea = document.getElementById("field-hotword_text");
+  if (!textarea) return false;
+  return textarea.value !== state.hotwordLibraryOriginalText;
+}
+
+// ----------------------------------------------------------
+// 自定义确认对话框：基于 Promise，返回用户点击的按钮值
+//
+// 为什么不用浏览器原生 window.confirm()：
+//   window.confirm() 只能显示「确定/取消」两个按钮，无法满足
+//   "仅临时使用 / 保存到热词库 / 取消"三个选项的需求。
+//   所以这里自己实现了一个简单 modal，复用项目现有深色主题样式。
+//
+// 参数 options：
+//   title  - 对话框标题
+//   body   - 对话框正文（支持 \n 换行）
+//   buttons - 按钮数组，每项 { label, value, cssClass }
+//             点击按钮后，Promise resolve(value)；
+//             点击遮罩或按 ESC resolve('cancel')
+//
+// 使用示例：
+//   const choice = await showHotwordDialog({
+//     title: "确认如何处理热词修改？",
+//     body: "你已经修改了当前热词内容。...",
+//     buttons: [
+//       { label: "仅临时使用", value: "temp", cssClass: "hotword-modal-btn-temp" },
+//       { label: "保存到热词库", value: "save", cssClass: "hotword-modal-btn-save" },
+//       { label: "取消", value: "cancel", cssClass: "hotword-modal-btn-cancel" },
+//     ],
+//   });
+//   if (choice === "save") { ... }
+// ----------------------------------------------------------
+function showHotwordDialog(options) {
+  return new Promise((resolve) => {
+    // 填充标题和正文
+    el.hotwordModalTitle.textContent = options.title || "";
+    el.hotwordModalBody.textContent = options.body || "";
+
+    // 创建按钮
+    el.hotwordModalActions.innerHTML = "";
+    for (const btn of (options.buttons || [])) {
+      const node = document.createElement("button");
+      node.type = "button";
+      node.textContent = btn.label;
+      node.className = btn.cssClass || "";
+      node.addEventListener("click", () => closeHotwordDialog(btn.value));
+      el.hotwordModalActions.appendChild(node);
+    }
+
+    // 显示对话框
+    el.hotwordModal.hidden = false;
+
+    // 把 resolve 暂存，关闭时调用
+    el.hotwordModal._resolve = resolve;
+
+    // ESC 键关闭（视为取消）
+    el.hotwordModal._onKey = (e) => {
+      if (e.key === "Escape") closeHotwordDialog("cancel");
+    };
+    document.addEventListener("keydown", el.hotwordModal._onKey);
+
+    // 点击遮罩关闭（视为取消）
+    el.hotwordModal._onBackdrop = (e) => {
+      if (e.target === el.hotwordModal.querySelector(".hotword-modal-backdrop")) {
+        closeHotwordDialog("cancel");
+      }
+    };
+    el.hotwordModal.addEventListener("click", el.hotwordModal._onBackdrop);
+  });
+}
+
+// ----------------------------------------------------------
+// 关闭确认对话框
+// value: 传给 Promise resolve 的值，表示用户的选择
+// ----------------------------------------------------------
+function closeHotwordDialog(value) {
+  el.hotwordModal.hidden = true;
+
+  // 移除事件监听，避免内存泄漏
+  if (el.hotwordModal._onKey) {
+    document.removeEventListener("keydown", el.hotwordModal._onKey);
+    el.hotwordModal._onKey = null;
+  }
+  if (el.hotwordModal._onBackdrop) {
+    el.hotwordModal.removeEventListener("click", el.hotwordModal._onBackdrop);
+    el.hotwordModal._onBackdrop = null;
+  }
+
+  // 触发 Promise resolve
+  if (typeof el.hotwordModal._resolve === "function") {
+    const resolve = el.hotwordModal._resolve;
+    el.hotwordModal._resolve = null;
+    resolve(value);
+  }
+}
+
+// ----------------------------------------------------------
+// 从服务器加载指定热词库的全部内容，并写入 textarea
+// libraryName: 热词库文件名（如 "Nikki.txt"）
+// textarea: 可选，如果已传入则直接更新 DOM；否则通过 id 查找
+// ----------------------------------------------------------
+async function loadHotwordLibraryContent(libraryName, textarea) {
+  try {
+    const result = await request("/api/hotwords/load", {
+      method: "POST",
+      body: JSON.stringify({ name: libraryName }),
+    });
+    const content = result.library.content;
+    // 更新状态：记录加载的库名和原始内容（作为脏数据检测的基准）
+    state.form.hotword_text = content;
+    state.hotwordLibraryLoaded = libraryName;
+    state.hotwordLibraryOriginalText = content;
+    // 更新 textarea DOM 显示
+    const ta = textarea || document.getElementById("field-hotword_text");
+    if (ta) ta.value = content;
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+// ----------------------------------------------------------
+// 热词库下拉框切换时的处理函数
+//
+// 行为说明：
+//   - 切换到"不使用"：先检查脏数据，提示用户确认后清空 textarea
+//   - 切换到有内容的热词库：检查脏数据，弹出对话框让用户选择：
+//       1. 不保存并切换 → 丢弃当前修改，加载新库
+//       2. 保存后切换   → 先保存到当前库，再加载新库
+//       3. 取消切换     → 什么都不做，恢复下拉框旧值
+//   - 如果 textarea 没有修改（不脏），直接加载新库，不弹对话框
+//
+// 注意：
+//   原生 window.confirm() 只能做 OK/Cancel 两个按钮，
+//   这里改用自定义 showHotwordDialog() 实现三按钮确认。
+// ----------------------------------------------------------
+async function handleHotwordLibraryChange(newValue) {
+  const textarea = document.getElementById("field-hotword_text");
+
+  // ── 切换到"不使用"（value 为空字符串）──
+  if (!newValue) {
+    if (isHotwordDirty()) {
+      const choice = await showHotwordDialog({
+        title: "当前热词内容有未保存修改",
+        body:
+          "切换到「不使用」会清空下方热词编辑区。\n" +
+          "当前未保存的修改不会写入任何热词库文件。\n\n" +
+          "你可以选择仅临时使用这些热词（本次任务有效），或直接放弃修改。",
+        buttons: [
+          { label: "仅临时使用", value: "temp", cssClass: "hotword-modal-btn-temp" },
+          { label: "放弃修改并切换", value: "discard", cssClass: "hotword-modal-btn-save" },
+          { label: "取消切换", value: "cancel", cssClass: "hotword-modal-btn-cancel" },
+        ],
+      });
+      if (choice === "cancel") return false;
+      // temp 和 discard 都允许切换，但不保留修改（切换后 textarea 清空）
+      if (choice === "temp") {
+        // 「仅临时使用」：保留 textarea 内容不清空，但不关联任何热词库
+        // 用户提交任务时这些热词仍然有效
+        state.hotwordLibraryLoaded = null;
+        state.hotwordLibraryOriginalText = "";
+        toast("当前热词已作为临时热词保留，本次任务有效，不会保存到热词库。");
+        return true;
+      }
+    }
+    // 清空 textarea 和关联状态
+    state.form.hotword_text = "";
+    state.hotwordLibraryLoaded = null;
+    state.hotwordLibraryOriginalText = "";
+    if (textarea) textarea.value = "";
+    return true;
+  }
+
+  // ── 切换到有内容的热词库 ──
+  if (isHotwordDirty()) {
+    const choice = await showHotwordDialog({
+      title: "当前热词内容有未保存修改",
+      body:
+        `你正在从「${state.hotwordLibraryLoaded || "(无)"}」切换到「${newValue}」。\n` +
+        "下方热词编辑区有未保存的修改。\n\n" +
+        "你可以选择：\n" +
+        "· 仅临时使用：保留当前编辑内容，但不保存到文件，切换后清空编辑区\n" +
+        "· 保存后切换：先把修改写回当前热词库文件，再加载新库\n" +
+        "· 取消切换：不做任何操作",
+      buttons: [
+        { label: "不保存并切换", value: "discard", cssClass: "hotword-modal-btn-temp" },
+        { label: "保存后切换", value: "saveAndSwitch", cssClass: "hotword-modal-btn-save" },
+        { label: "取消切换", value: "cancel", cssClass: "hotword-modal-btn-cancel" },
+      ],
+    });
+
+    if (choice === "cancel") return false;
+
+    if (choice === "saveAndSwitch") {
+      // 先保存到当前库，再加载新库
+      try {
+        await saveHotwordContent();
+      } catch (e) {
+        toast(`保存失败：${e.message}，已取消切换。`, "error");
+        return false;
+      }
+    }
+    // discard 和 saveAndSwitch 都继续：加载新库
+  }
+
+  // 加载新热词库内容到 textarea
+  await loadHotwordLibraryContent(newValue, textarea);
+  return true;
+}
+
+// ----------------------------------------------------------
+// 纯保存函数：不弹对话框，直接把 textarea 内容写入当前热词库文件
+//
+// 这个函数是保存的底层实现，被以下两个入口调用：
+//   1. saveToHotwordLibrary()    → 先弹确认框，用户点"保存到热词库"后调用
+//   2. handleHotwordLibraryChange() → 用户选"保存后切换"时调用
+//
+// 保存成功后会自动更新 hotwordLibraryOriginalText，
+// 这样后续 isHotwordDirty() 会返回 false，表示内容已与文件同步。
+// ----------------------------------------------------------
+async function saveHotwordContent() {
+  const textarea = document.getElementById("field-hotword_text");
+  if (!textarea) throw new Error("找不到热词编辑区");
+
+  const result = await request("/api/hotwords/save", {
+    method: "POST",
+    body: JSON.stringify({
+      name: state.hotwordLibraryLoaded,
+      content: textarea.value,
+    }),
+  });
+  // 保存成功后同步状态：更新原始内容基准，后续不再提示脏数据
+  state.hotwordLibraryOriginalText = textarea.value;
+  state.form.hotword_text = textarea.value;
+  return result;
+}
+
+// ----------------------------------------------------------
+// 保存到热词库按钮的点击处理
+//
+// 这是用户点击「保存到热词库」按钮时触发的入口函数。
+// 它不会直接保存，而是先弹出确认对话框，让用户明确选择：
+//   A. 仅临时使用：修改只用于本次 ASR 任务，不写文件
+//   B. 保存到热词库：真正修改 configs/hotwords/*.txt 文件
+//   C. 取消：什么都不做
+//
+// 为什么要弹确认框？
+//   因为修改 configs/hotwords/*.txt 是持久化操作，
+//   会影响以后每次选中该热词库时的内容。
+//   用户需要明确知道这次点击会修改文件，而不是临时生效。
+// ----------------------------------------------------------
+async function saveToHotwordLibrary() {
+  // 没有选中热词库：不允许保存（因为没有目标文件可写）
+  if (!state.hotwordLibraryLoaded) {
+    toast("请先选择热词库。未选择热词库时，当前内容只能作为临时热词用于本次任务。", "warn");
+    return;
+  }
+
+  // textarea 内容没有变化：没必要保存
+  if (!isHotwordDirty()) {
+    toast("当前内容没有变化，无需保存。", "warn");
+    return;
+  }
+
+  // 弹出确认对话框
+  const choice = await showHotwordDialog({
+    title: "确认如何处理热词修改？",
+    body:
+      `你已经修改了当前热词内容（热词库：${state.hotwordLibraryLoaded}）。\n\n` +
+      "如果选择「仅临时使用」：\n" +
+      "  这些修改只会用于本次识别任务，不会保存到长期热词库文件。\n" +
+      "  下次选择该热词库时，看到的仍然是修改前的内容。\n\n" +
+      "如果选择「保存到热词库」：\n" +
+      "  当前内容会写入已选择的热词库文件（位于 configs/hotwords 目录），\n" +
+      "  之后无论哪次任务选择该热词库，都会看到修改后的内容。",
+    buttons: [
+      { label: "仅临时使用", value: "temp", cssClass: "hotword-modal-btn-temp" },
+      { label: "保存到热词库", value: "save", cssClass: "hotword-modal-btn-save" },
+      { label: "取消", value: "cancel", cssClass: "hotword-modal-btn-cancel" },
+    ],
+  });
+
+  if (choice === "cancel") return;
+
+  if (choice === "temp") {
+    // 「仅临时使用」：不调保存 API，保留 textarea 内容用于本次任务
+    // 注意：不更新 hotwordLibraryOriginalText，所以下次切换/保存时仍会提示脏数据
+    toast("已作为临时热词使用，本次任务有效，不会保存到热词库。");
+    return;
+  }
+
+  if (choice === "save") {
+    // 「保存到热词库」：调用 API 写回文件
+    try {
+      const result = await saveHotwordContent();
+      toast(`已保存到热词库「${result.library.stem}」（${result.library.entries} 条）。`);
+    } catch (e) {
+      toast(`保存失败：${e.message}`, "error");
+      // 保存失败时不修改 textarea，也不更新 hotwordLibraryOriginalText
+    }
+  }
+}
+
+// ----------------------------------------------------------
+// 保存到当前热词库按钮的点击处理
+//
+// 这个按钮位于热词编辑区（textarea）下方右侧，文案为「保存到当前热词库」。
+//
+// 和底部「保存到热词库」按钮的区别：
+//   底部按钮提供三选一（仅临时使用/保存到热词库/取消），
+//   而这个按钮定位更明确——用户就是想保存，只需确认是否真的写入文件。
+//   因此这里使用两按钮确认框（保存到热词库/取消），流程更短。
+//
+// 行为说明：
+//   1. 未选热词库 → toast 提示"请先选择热词库"，不弹对话框
+//   2. textarea 无修改 → toast 提示"无需保存"，不弹对话框
+//   3. textarea 有修改 → 弹出确认对话框
+//      - 确认 → 调用 saveHotwordContent() 真正写入 .txt 文件
+//      - 取消 → 不保存，textarea 内容保留
+// ----------------------------------------------------------
+async function saveToCurrentHotwordLibrary() {
+  // 没有选中热词库：不允许保存（没有目标文件可写）
+  // textarea 中的热词仍然有效，提交任务时会使用，只是无法保存回库文件
+  if (!state.hotwordLibraryLoaded) {
+    toast("请先选择热词库。未选择热词库时，当前内容只能作为临时热词用于本次任务。", "warn");
+    return;
+  }
+
+  // textarea 内容没有变化：没必要写文件，避免无意义的 API 调用
+  if (!isHotwordDirty()) {
+    toast("当前热词内容没有变化，无需保存。", "warn");
+    return;
+  }
+
+  // 弹出两按钮确认对话框
+  // 这里不需要"仅临时使用"选项，因为用户点击这个按钮的意图就是保存
+  const choice = await showHotwordDialog({
+    title: "确认保存热词库？",
+    body:
+      `当前编辑框中的热词内容将写入已选择的长期热词库文件（${state.hotwordLibraryLoaded}）。\n\n` +
+      "保存后，以后再次选择这个热词库时，也会看到这些修改。\n\n" +
+      "如果你只是想让这些热词用于本次识别任务，请不要保存，直接提交任务即可。",
+    buttons: [
+      { label: "保存到热词库", value: "save", cssClass: "hotword-modal-btn-save" },
+      { label: "取消", value: "cancel", cssClass: "hotword-modal-btn-cancel" },
+    ],
+  });
+
+  if (choice === "cancel") return;
+
+  // 用户确认保存：调用底层 saveHotwordContent() 写回热词库文件
+  try {
+    await saveHotwordContent();
+    toast("已保存到当前热词库。");
+  } catch (e) {
+    // 保存失败时：保留 textarea 内容，不更新 hotwordLibraryOriginalText
+    // 这样下次仍然可以尝试保存，不会丢失用户的修改
+    toast(`保存失败：${e.message}`, "error");
+  }
+}
+
 async function init() {
   try {
     const meta = await request("/api/meta");
@@ -581,6 +997,7 @@ async function init() {
 
     el.submitTaskBtn.addEventListener("click", () => submitTask().catch((e) => toast(e.message, "error")));
     el.saveDefaultsBtn.addEventListener("click", () => savePreferences().catch((e) => toast(e.message, "error")));
+    el.saveHotwordBtn.addEventListener("click", () => saveToHotwordLibrary().catch((e) => toast(e.message, "error")));
     el.openInputsBtn.addEventListener("click", () => openSystemPath("inputs").catch((e) => toast(e.message, "error")));
     el.retryJobBtn.addEventListener("click", () => retrySelectedJob().catch((e) => toast(e.message, "error")));
     el.cancelJobBtn.addEventListener("click", () => cancelSelectedJob().catch((e) => toast(e.message, "error")));

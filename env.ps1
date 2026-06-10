@@ -50,10 +50,11 @@ $env:QWEN_ASR_CACHE = Join-Path $CacheRoot "qwen_asr"
 #
 # PATH 可以理解为“系统查找命令的位置清单”。当脚本运行 ffmpeg 时，Windows 会按 PATH
 # 从前往后找 ffmpeg.exe。把项目内 ffmpeg 放在前面，表示本项目优先使用自己的工具版本。
-if (
-    (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffmpeg.exe") -PathType Leaf) -and
-    (Test-Path -LiteralPath (Join-Path $FfmpegBin "ffprobe.exe") -PathType Leaf)
-) {
+# 多行 if 条件在 Windows PowerShell 5.1 下可能触发解析错误，
+# 这里用单行条件 + 逗号换行（数组风格），避免跨行 if 条件块的语法歧义。
+$ffmpegExe = Join-Path $FfmpegBin "ffmpeg.exe"
+$ffprobeExe = Join-Path $FfmpegBin "ffprobe.exe"
+if ((Test-Path -LiteralPath $ffmpegExe -PathType Leaf) -and (Test-Path -LiteralPath $ffprobeExe -PathType Leaf)) {
     $pathItems = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($pathItems -notcontains $FfmpegBin) {
         $env:PATH = ($FfmpegBin + ";" + $env:PATH)
