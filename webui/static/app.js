@@ -1,3 +1,11 @@
+// ── 常量定义 ──
+const TOAST_DURATION_MS = 3000;
+const JOBS_POLL_INTERVAL_MS = 2500;
+const RESULTS_POLL_INTERVAL_MS = 5000;
+const AUDIO_PREVIEW_LIMIT = 12;
+const ARTIFACT_LIST_LIMIT = 80;
+const RESULT_PREVIEW_CHARS = 300;
+
 const state = {
   meta: null,
   form: {},
@@ -15,6 +23,7 @@ const state = {
   // ----------------------------------------------------------
   hotwordLibraryLoaded: null,
   hotwordLibraryOriginalText: "",
+  submitting: false,
 };
 
 const el = {
@@ -114,7 +123,7 @@ function toast(message, type = "") {
   node.className = `toast ${type}`.trim();
   node.textContent = message;
   el.toastStack.appendChild(node);
-  setTimeout(() => node.remove(), 3000);
+  setTimeout(() => node.remove(), TOAST_DURATION_MS);
 }
 
 async function request(url, options = {}) {
@@ -475,12 +484,22 @@ async function refreshJobs() {
 }
 
 async function submitTask() {
-  const payload = { ...state.form, title: el.taskTitle.value.trim() };
-  const result = await request("/api/jobs/asr", { method: "POST", body: JSON.stringify(payload) });
-  const job = result.job;
-  if (job.warning) toast(job.warning);
-  state.selectedJobId = job.id;
-  await refreshJobs();
+  if (state.submitting) return;
+  state.submitting = true;
+  el.submitTaskBtn.disabled = true;
+  el.submitTaskBtn.textContent = "提交中...";
+  try {
+    const payload = { ...state.form, title: el.taskTitle.value.trim() };
+    const result = await request("/api/jobs/asr", { method: "POST", body: JSON.stringify(payload) });
+    const job = result.job;
+    if (job.warning) toast(job.warning);
+    state.selectedJobId = job.id;
+    await refreshJobs();
+  } finally {
+    state.submitting = false;
+    el.submitTaskBtn.disabled = false;
+    el.submitTaskBtn.textContent = "提交识别任务";
+  }
 }
 
 async function savePreferences() {
@@ -566,7 +585,7 @@ async function renderResultDetail(force = false) {
   const lines = [];
   const warning = result.meta?.warning || result.warning || "";
   const audioArtifacts = collectAudioArtifacts(result);
-  const previewArtifacts = audioArtifacts.slice(0, 12);
+  const previewArtifacts = audioArtifacts.slice(0, AUDIO_PREVIEW_LIMIT);
   if (warning) {
     lines.push(`<div class="warning">[警告] ${escapeHtml(warning)}</div>`);
   }
@@ -600,9 +619,9 @@ async function renderResultDetail(force = false) {
   }
   if (result.artifacts?.length) {
     lines.push("<hr>");
-    lines.push(`<details class="artifact-block"><summary>产物文件（展示前 ${Math.min(result.artifacts.length, 80)} / ${result.artifacts.length}）</summary>`);
+    lines.push(`<details class="artifact-block"><summary>产物文件（展示前 ${Math.min(result.artifacts.length, ARTIFACT_LIST_LIMIT)} / ${result.artifacts.length}）</summary>`);
     lines.push('<ul class="artifact-list">');
-    for (const art of result.artifacts.slice(0, 80)) {
+    for (const art of result.artifacts.slice(0, ARTIFACT_LIST_LIMIT)) {
       const url = buildResultArtifactUrl(result.id, art.relative_path);
       lines.push(`<li><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(art.relative_path)}</a> (${escapeHtml(formatBytes(art.size))})</li>`);
     }
@@ -1006,8 +1025,8 @@ async function init() {
     el.openProjectBtn.addEventListener("click", () => openSystemPath("project").catch((e) => toast(e.message, "error")));
     el.openOutputsBtn.addEventListener("click", () => openSystemPath("outputs").catch((e) => toast(e.message, "error")));
 
-    setInterval(() => refreshJobs().catch(() => {}), 2500);
-    setInterval(() => refreshResults(false).catch(() => {}), 5000);
+  setInterval(() => refreshJobs().catch(() => {}), JOBS_POLL_INTERVAL_MS);
+  setInterval(() => refreshResults(false).catch(() => {}), RESULTS_POLL_INTERVAL_MS);
   } catch (error) {
     toast(error.message || String(error), "error");
   }

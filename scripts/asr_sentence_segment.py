@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 离线音频 -> Qwen3-ASR 转写+对齐 -> 句子级切分 -> 每句导出 wav/txt/index.jsonl
 """
@@ -9,6 +8,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,12 +16,18 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 import soundfile as sf
+from shared import project_root, read_split_defaults
+
+logger = logging.getLogger("qwen3_asr")
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.setLevel(logging.INFO)
 
 
 # 贪心分句使用的边界集合。
@@ -66,15 +72,6 @@ PUNCT_NORMALIZE_MAP = {
     ")": "）",
 }
 
-DEFAULT_SPLIT_DEFAULTS: dict[str, float] = {
-    "pause_threshold": 0.60,
-    "min_dur": 0.80,
-    "max_dur": 8.00,
-    "pad_left": 0.05,
-    "pad_right": 0.10,
-}
-
-
 @dataclass
 class CharStamp:
     char: str
@@ -82,8 +79,18 @@ class CharStamp:
     end: float
 
 
+def to_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def log(msg: str) -> None:
-    print(f"[asr] {msg}", flush=True)
+    """项目统一的日志输出入口。"""
+    logger.info(msg)
 
 
 def format_seconds_short(seconds: float) -> str:
@@ -104,15 +111,11 @@ def get_field(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def safe_filename_from_text(text: str, max_len: int = 80) -> str:
-    """
-    将识别文本转换为适合 Windows 的文件名主体。
-    保留可读内容，同时避开非法字符和过长文件名。
-    """
+    """将识别文本转换为适合 Windows 的文件名主体。"""
     raw = (text or "").strip()
     if not raw:
         return "segment"
 
-    # 用空格替换非法字符和控制字符，保证 Windows 文件名安全。
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
 
@@ -127,52 +130,9 @@ def safe_filename_from_text(text: str, max_len: int = 80) -> str:
 
 
 def segment_basename(idx: int, text: str, max_preview_len: int = 48) -> str:
-    """
-    生成稳定、可排序、可追踪的分段文件名主体。
-
-    为什么不再直接把整句识别文本当文件名：
-    1. Windows 资源管理器默认按文件名排序，纯文本文件名会按汉字拼音/字符顺序排，
-       不是按音频时间顺序排，用户很容易误以为 wav 和 txt 错位。
-    2. 长句会被资源管理器截断显示，多个文件看起来像同一个名字，排查非常困难。
-    3. 文本里如果刚好有奇怪标点，文件名也会跟着变得很难看。
-
-    所以文件名固定为：
-      seg_0001__文本预览.wav
-      seg_0001__文本预览.txt
-    其中 `seg_0001` 是真正的稳定主键，后面的中文只是方便肉眼快速识别。
-    """
+    """生成稳定、可排序、可追踪的分段文件名主体。"""
     preview = safe_filename_from_text(text, max_len=max_preview_len)
     return f"seg_{idx:04d}__{preview}"
-
-
-def to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def read_split_defaults() -> dict[str, float]:
-    defaults = dict(DEFAULT_SPLIT_DEFAULTS)
-    config_path = project_root() / "configs" / "defaults.json"
-    if not config_path.exists():
-        return defaults
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-        for key, fallback in DEFAULT_SPLIT_DEFAULTS.items():
-            try:
-                defaults[key] = float(payload.get(key, fallback))
-            except Exception:
-                defaults[key] = fallback
-    except Exception:
-        return defaults
-    return defaults
 
 
 def ensure_dir(path: Path) -> None:
@@ -184,7 +144,7 @@ def default_out_dir() -> Path:
     return project_root() / "outputs" / f"run_{stamp}"
 
 
-def normalize_language(language: str) -> Optional[str]:
+def normalize_language(language: str) -> str | None:
     if language is None:
         return None
     v = language.strip().lower()
@@ -244,8 +204,7 @@ def ffmpeg_convert_to_wav16k_mono(src_audio: Path, dst_wav: Path) -> None:
     try:
         proc = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -267,7 +226,7 @@ def get_wav_duration_seconds(wav_path: Path) -> float:
     return float(info.frames) / float(info.samplerate)
 
 
-def probe_audio_stream_info(src_audio: Path) -> Tuple[int, int]:
+def probe_audio_stream_info(src_audio: Path) -> tuple[int, int]:
     cmd = [
         "ffprobe",
         "-v",
@@ -283,8 +242,7 @@ def probe_audio_stream_info(src_audio: Path) -> Tuple[int, int]:
     try:
         proc = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -347,8 +305,7 @@ def ffmpeg_export_segment_from_source(
     try:
         subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -369,11 +326,11 @@ def quiet_transformers_logging() -> None:
         from transformers.utils import logging as hf_logging
 
         hf_logging.set_verbosity_error()
-    except Exception:
+    except ImportError:
         pass
 
 
-def pick_device_and_dtype(force_cpu: bool = False) -> Tuple[str, Any]:
+def pick_device_and_dtype(force_cpu: bool = False) -> tuple[str, Any]:
     import torch
 
     if not force_cpu and torch.cuda.is_available():
@@ -452,21 +409,21 @@ def clear_cuda_cache() -> None:
             if hasattr(torch.cuda, "ipc_collect"):
                 try:
                     torch.cuda.ipc_collect()
-                except Exception:
+                except (RuntimeError, AttributeError):
                     pass
-    except Exception:
+    except ImportError:
         pass
 
 
 def transcribe_with_timestamps(
     model: Any,
     wav_path: Path,
-    language: Optional[str],
+    language: str | None,
     context: str = "",
     wav_duration_sec: float = 0.0,
     progress_interval_sec: int = 30,
     eta_rtf: float = 2.0,
-) -> Tuple[str, Sequence[Any], Optional[str]]:
+) -> tuple[str, Sequence[Any], str | None]:
     start_ts = time.time()
     done = threading.Event()
     safe_rtf = max(0.05, float(eta_rtf))
@@ -526,8 +483,8 @@ def transcribe_with_timestamps(
     return text, time_stamps, out_lang
 
 
-def parse_unit_timestamps(time_stamps: Sequence[Any]) -> List[Tuple[str, float, float]]:
-    units: List[Tuple[str, float, float]] = []
+def parse_unit_timestamps(time_stamps: Sequence[Any]) -> list[tuple[str, float, float]]:
+    units: list[tuple[str, float, float]] = []
     for item in time_stamps:
         text = str(get_field(item, "text", "") or "")
         if not text:
@@ -543,8 +500,8 @@ def parse_unit_timestamps(time_stamps: Sequence[Any]) -> List[Tuple[str, float, 
     return units
 
 
-def expand_units_to_char_timeline(units: Sequence[Tuple[str, float, float]]) -> List[CharStamp]:
-    timeline: List[CharStamp] = []
+def expand_units_to_char_timeline(units: Sequence[tuple[str, float, float]]) -> list[CharStamp]:
+    timeline: list[CharStamp] = []
     for text, start, end in units:
         chars = list(text)
         if not chars:
@@ -559,7 +516,7 @@ def expand_units_to_char_timeline(units: Sequence[Tuple[str, float, float]]) -> 
     return timeline
 
 
-def extract_text_from_punc_result(obj: Any) -> Optional[str]:
+def extract_text_from_punc_result(obj: Any) -> str | None:
     if obj is None:
         return None
     if isinstance(obj, str):
@@ -594,7 +551,7 @@ def normalize_punctuation_text(text: str) -> str:
     3. 连续重复的标点只保留一个，避免出现 `，，`、`！！`。
     4. 不修改汉字、英文、数字本身。
     """
-    normalized_chars: List[str] = []
+    normalized_chars: list[str] = []
     previous_punct = ""
 
     for raw_ch in text or "":
@@ -676,11 +633,11 @@ def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
     return validate_punctuation_text(raw_text, text) if text else raw_text
 
 
-def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: str) -> List[CharStamp]:
+def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: str) -> list[CharStamp]:
     if not raw_timeline:
         return []
 
-    merged: List[CharStamp] = []
+    merged: list[CharStamp] = []
     i = 0
 
     for ch in normalize_punctuation_text(punc_text):
@@ -738,14 +695,14 @@ def greedy_sentence_split(
     max_dur: float,
     pad_left: float,
     pad_right: float,
-) -> List[dict]:
+) -> list[dict]:
     if not timeline:
         return []
 
     pause_edges = collect_pause_edges(timeline, pause_threshold)
     n = len(timeline)
     i = 0
-    chunks: List[dict] = []
+    chunks: list[dict] = []
 
     while i < n:
         start_t = timeline[i].start
@@ -754,9 +711,9 @@ def greedy_sentence_split(
         while hard_end + 1 < n and timeline[hard_end + 1].end <= max_end_t:
             hard_end += 1
 
-        strong_candidates: List[int] = []
-        soft_candidates: List[int] = []
-        pause_candidates: List[int] = []
+        strong_candidates: list[int] = []
+        soft_candidates: list[int] = []
+        pause_candidates: list[int] = []
 
         for j in range(i, hard_end + 1):
             cur_dur = timeline[j].end - start_t
@@ -820,13 +777,13 @@ def write_segments_and_index(
     source_audio: Path,
     segments: Sequence[dict],
     out_dir: Path,
-) -> List[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     seg_dir = out_dir / "segments"
     ensure_dir(seg_dir)
     sample_rate, channels = probe_audio_stream_info(source_audio)
     log(f"导出音频规格: {sample_rate} Hz / {channels} ch（与输入保持一致）")
     used_name_count: dict[str, int] = {}
-    written_segments: List[dict[str, Any]] = []
+    written_segments: list[dict[str, Any]] = []
 
     index_path = out_dir / "index.jsonl"
     with index_path.open("w", encoding="utf-8") as f_index:
@@ -1065,7 +1022,7 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     if not text.strip() and not units:
         warning_message = "音频可能为静默、噪声过大，或未包含可识别语音，最终结果为空"
         log(f"警告: {warning_message}")
-        char_timeline: List[CharStamp] = []
+        char_timeline: list[CharStamp] = []
     else:
         if not units:
             raise RuntimeError("time_stamps 无可用 unit，无法切分。")
@@ -1104,7 +1061,7 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
         log(f"警告: {warning_message}")
     exported_segments = write_segments_and_index(source_audio=audio_path, segments=segments, out_dir=out_dir)
 
-    qwen3_tts_manifest_path: Optional[Path] = None
+    qwen3_tts_manifest_path: Path | None = None
     if dataset_format == "qwen3_tts":
         if str(args.ref_audio or "").strip():
             log("附加导出: 生成 Qwen3-TTS 微调清单（包含参考音频字段）")
@@ -1189,7 +1146,7 @@ def main() -> int:
             import torch
 
             cuda_available = torch.cuda.is_available()
-        except Exception:
+        except ImportError:
             cuda_available = False
 
         if cuda_available:
@@ -1205,5 +1162,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         print("\n[asr] 用户中断。", file=sys.stderr)
-        raise SystemExit(130)
+        raise SystemExit(130) from None
 

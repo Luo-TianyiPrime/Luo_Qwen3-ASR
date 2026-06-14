@@ -8,6 +8,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +16,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+_scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+
+from shared import read_split_defaults  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOT = PROJECT_ROOT / ".cache" / "webui"
@@ -39,14 +46,6 @@ PROGRESS_SAVE_INTERVAL_SECONDS = 5.0
 PROGRESS_SAVE_DELTA_PERCENT = 5.0
 RESULTS_CACHE_TTL_SECONDS = 5.0
 
-DEFAULT_SPLIT_DEFAULTS: dict[str, float] = {
-    "pause_threshold": 0.60,
-    "min_dur": 0.80,
-    "max_dur": 8.00,
-    "pad_left": 0.05,
-    "pad_right": 0.10,
-}
-
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -69,7 +68,7 @@ def read_json_file(path: Path, default: Any) -> Any:
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return default
 
 
@@ -86,7 +85,7 @@ def write_json_file(path: Path, data: Any) -> None:
     finally:
         try:
             tmp.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
 
@@ -172,7 +171,7 @@ def _path_is_within_any_root(target: Path, roots: list[Path]) -> bool:
     for root in roots:
         try:
             resolved_root = root.resolve()
-        except Exception:
+        except OSError:
             continue
         if resolved_target == resolved_root or resolved_root in resolved_target.parents:
             return True
@@ -210,17 +209,6 @@ def guess_media_type(path: Path) -> str:
     return media_type or "application/octet-stream"
 
 
-def read_split_defaults() -> dict[str, float]:
-    loaded = read_json_file(SHARED_DEFAULTS_PATH, {})
-    out = dict(DEFAULT_SPLIT_DEFAULTS)
-    for key, fallback in DEFAULT_SPLIT_DEFAULTS.items():
-        try:
-            out[key] = float(loaded.get(key, fallback))
-        except Exception:
-            out[key] = fallback
-    return out
-
-
 def probe_audio_duration_seconds(audio_path: Path, timeout: int = 10) -> float | None:
     try:
         result = subprocess.run(
@@ -243,7 +231,7 @@ def probe_audio_duration_seconds(audio_path: Path, timeout: int = 10) -> float |
         )
         value = float((result.stdout or "").strip())
         return value if value > 0 else None
-    except Exception:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, ValueError, OSError):
         return None
 
 
@@ -280,7 +268,7 @@ class JobRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "JobRecord":
+    def from_dict(cls, payload: dict[str, Any]) -> JobRecord:
         return cls(
             id=str(payload.get("id", "")),
             kind=str(payload.get("kind", "asr")),
@@ -549,7 +537,7 @@ class JobManager:
     def _cleanup_hotword_runtime_file(self, job_id: str) -> None:
         try:
             (HOTWORD_RUNTIME_ROOT / f"{job_id}.txt").unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
     def _terminate_process_tree(self, process: subprocess.Popen[str]) -> None:
@@ -561,12 +549,12 @@ class JobManager:
                 timeout=15,
                 check=False,
             )
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             pass
         if process.poll() is None:
             try:
                 process.kill()
-            except Exception:
+            except OSError:
                 pass
 
     def _load_jobs(self) -> None:
@@ -693,7 +681,7 @@ class JobManager:
                     out[key] = default
                 else:
                     out[key] = value
-            except Exception:
+            except (TypeError, ValueError):
                 out[key] = default
         return out
 
@@ -1341,7 +1329,7 @@ class JobManager:
             try:
                 preview = txt.read_text(encoding="utf-8", errors="replace").strip()[:300]
                 break
-            except Exception:
+            except OSError:
                 preview = ""
         return {
             "id": make_result_id(run_dir),
@@ -1458,7 +1446,7 @@ class JobManager:
             if not _path_is_within_any_root(target, allowed_roots):
                 try:
                     cached_results = self.list_results(refresh=False)
-                except Exception:
+                except OSError:
                     cached_results = []
                 for item in cached_results:
                     run_dir = str(item.get("run_dir", "") or "").strip()

@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 
 from .service import PROJECT_ROOT, guess_media_type, manager, resolve_project_path
 
-
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 
 
