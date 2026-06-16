@@ -452,6 +452,16 @@ class JobManager:
         },
         {
             "group": "runtime",
+            "key": "max_new_tokens",
+            "label": "最大生成 Token 数（不懂就默认 2048）",
+            "type": "number",
+            "step": 256,
+            "min": 64,
+            "description": "每次 ASR 推理的最大输出 token 数。值越大 KV 缓存占显存越多",
+            "long_help": "正常语音识别输出通常在 2000 tokens 以内。如果爆显存，优先降低这个值到 1024。",
+        },
+        {
+            "group": "runtime",
             "key": "eta_rtf",
             "label": "ETA 估算速度（只影响显示）",
             "type": "number",
@@ -651,6 +661,7 @@ class JobManager:
             "language": "None",
             "punc_model": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
             "batch_size": 1,
+            "max_new_tokens": 2048,
             "pause_threshold": split["pause_threshold"],
             "min_dur": split["min_dur"],
             "max_dur": split["max_dur"],
@@ -885,6 +896,8 @@ class JobManager:
             str(float(config.get("pad_right", 0.1))),
             "-BatchSize",
             str(int(config.get("batch_size", 1))),
+            "-MaxNewTokens",
+            str(int(config.get("max_new_tokens", 2048))),
             "-EtaRTF",
             str(float(config.get("eta_rtf", 2.0))),
         ]

@@ -36,6 +36,7 @@ param(
     [double]$PadLeft,
     [double]$PadRight,
     [int]$BatchSize,
+    [int]$MaxNewTokens,
     [double]$EtaRTF,
     [switch]$ScanSubfolders,
     [switch]$ShowConfig,
@@ -264,6 +265,7 @@ function Invoke-OneAudio {
         "--pad_left", "$($Cfg.PadLeft)",
         "--pad_right", "$($Cfg.PadRight)",
         "--batch_size", "$($Cfg.BatchSize)",
+        "--max_new_tokens", "$($Cfg.MaxNewTokens)",
         "--eta_rtf", "$($Cfg.EtaRTF)"
     )
 
@@ -380,6 +382,12 @@ $Config = [ordered]@{
     # - 以 12GB 显存为例，常见可以从 2 或 4 试起；如果你不确定，就先用 1
     BatchSize = 1
 
+    # ASR 最大生成 token 数（max_new_tokens）：
+    # - 控制每次 ASR 推理的最大输出长度，值越大 KV 缓存占用显存越多
+    # - 正常语音识别输出通常在 2000 tokens 以内
+    # - 如果显存不足，优先降低这个值（如 1024 或 2048）
+    MaxNewTokens = 2048
+
     # 分句参数（单位：秒）
     PauseThreshold = $SplitDefaults.PauseThreshold
     MinDur = $SplitDefaults.MinDur
@@ -419,6 +427,7 @@ if ($PSBoundParameters.ContainsKey("AlignerCkpt")) { $Config.AlignerCkpt = $Alig
 if ($PSBoundParameters.ContainsKey("Language")) { $Config.Language = $Language }
 if ($PSBoundParameters.ContainsKey("PuncModel")) { $Config.PuncModel = $PuncModel }
 if ($PSBoundParameters.ContainsKey("BatchSize")) { $Config.BatchSize = $BatchSize }
+if ($PSBoundParameters.ContainsKey("MaxNewTokens")) { $Config.MaxNewTokens = $MaxNewTokens }
 if ($PSBoundParameters.ContainsKey("PauseThreshold")) { $Config.PauseThreshold = $PauseThreshold }
 if ($PSBoundParameters.ContainsKey("MinDur")) { $Config.MinDur = $MinDur }
 if ($PSBoundParameters.ContainsKey("MaxDur")) { $Config.MaxDur = $MaxDur }
@@ -525,6 +534,10 @@ if (-not [string]::IsNullOrWhiteSpace($Config.RefAudio)) {
 
 if ([int]$Config.BatchSize -lt 1) {
     throw (New-ActionableError -Problem "BatchSize 非法。" -Cause "批大小至少要是 1；填成 0、负数，或者不小心传了空值都会失败。" -NextStep "先保持 `BatchSize = 1`，跑通后再慢慢调大。")
+}
+
+if ([int]$Config.MaxNewTokens -lt 1) {
+    throw (New-ActionableError -Problem "MaxNewTokens 非法。" -Cause "最大 token 数至少要是 1；填成 0、负数，或者不小心传了空值都会失败。" -NextStep "先保持 `MaxNewTokens = 2048`，如果爆显存可以再降低到 1024。")
 }
 
 if (-not (Test-Path -LiteralPath $Config.AsrCkpt)) {

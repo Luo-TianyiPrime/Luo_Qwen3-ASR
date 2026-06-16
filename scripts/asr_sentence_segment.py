@@ -357,10 +357,12 @@ def load_qwen_asr_model(
     common_kwargs = {
         "dtype": dtype,
         "device_map": device,
+        "low_cpu_mem_usage": True,
         "forced_aligner": aligner_ckpt,
         "forced_aligner_kwargs": {
             "dtype": dtype,
             "device_map": device,
+            "low_cpu_mem_usage": True,
         },
     }
 
@@ -934,7 +936,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_dur", type=float, default=split_defaults["max_dur"], help="Maximum sentence duration (s)")
     parser.add_argument("--pad_left", type=float, default=split_defaults["pad_left"], help="Left padding (s)")
     parser.add_argument("--pad_right", type=float, default=split_defaults["pad_right"], help="Right padding (s)")
-    parser.add_argument("--max_new_tokens", type=int, default=15000, help="ASR max_new_tokens")
+    parser.add_argument("--max_new_tokens", type=int, default=2048, help="ASR max_new_tokens")
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -984,6 +986,7 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     quiet_transformers_logging()
     log("步骤 2/5: 加载 Qwen3-ASR + ForcedAligner")
     log(f"ASR 批大小(batch_size): {batch_size}")
+    clear_cuda_cache()
     model = load_qwen_asr_model(
         asr_ckpt=args.asr_ckpt,
         aligner_ckpt=args.aligner_ckpt,
