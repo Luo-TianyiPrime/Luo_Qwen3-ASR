@@ -596,6 +596,15 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 - 如果出现显存不足，第一步通常就是把它调小
 - 只有你确认 GPU 余量足够时，再尝试调大
 
+显存安全相关参数：
+
+- `MaxNewTokens`：每个音频块最多生成多少 token。token 可以粗略理解为模型内部的一小段文字单位；默认 `1024`。值越大越不容易截断，但 KV 缓存越大、越吃显存，也更容易在异常片段上拖很久。
+- `ChunkSeconds`：长音频安全分块时长，默认 `60` 秒。块越短，单次峰值显存越低；4070S 12GB 如果仍然卡，可以试 `30`。
+- `MinCudaFreeGB`：GPU 推理前最低空闲显存，默认 `9.5` GiB。空闲显存不够时脚本会提前报错，避免 Windows 桌面一起卡死。
+- `ForceCpu`：强制 CPU 推理。速度会慢很多，但适合用短音频排查“是不是显存/GPU 导致的问题”。
+
+新手建议：`BatchSize = 1`、`MaxNewTokens = 1024`、`ChunkSeconds = 60`、`MinCudaFreeGB = 9.5` 先不要动。确认能稳定跑完后，再根据显存余量微调。
+
 ### 7.10 `PauseThreshold`
 
 作用：按停顿切分句子的阈值，单位是秒。

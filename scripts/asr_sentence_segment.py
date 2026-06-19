@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,8 +27,24 @@ import soundfile as sf
 from shared import project_root, read_split_defaults
 
 logger = logging.getLogger("qwen3_asr")
-logger.addHandler(logging.StreamHandler(sys.stdout))
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler(sys.stdout))
 logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+# 下面这几个默认值是“保守安全档”，优先保证 12GB 级别显卡不会被一次任务压到整机卡死。
+# - CHUNK_SECONDS：每次只把一小段音频送进模型。块越短，峰值显存越低，但总块数会变多。
+# - MAX_NEW_TOKENS：限制每块最多生成多少 token。token 可以粗略理解为模型内部的“文字小片段”，
+#   上限越高，模型越不容易截断长句，但 KV 缓存越大、越吃显存，也更容易在异常音频上长时间生成。
+# - MIN_CUDA_FREE_GB：启动 GPU 推理前要求至少有多少空闲显存；不够就直接报错，避免 Windows 桌面一起卡死。
+DEFAULT_CHUNK_SECONDS = 60.0
+DEFAULT_MAX_NEW_TOKENS = 1024
+DEFAULT_MIN_CUDA_FREE_GB = 9.5
+
+
+class GpuSafetyPrecheckError(RuntimeError):
+    """GPU 空闲显存低于安全线时抛出，用来阻止任务继续把桌面拖卡。"""
 
 
 # 贪心分句使用的边界集合。
@@ -343,6 +360,70 @@ def pick_device_and_dtype(force_cpu: bool = False) -> tuple[str, Any]:
     return "cpu", torch.float32
 
 
+def format_gib(num_bytes: int | float) -> str:
+    """把字节数格式化成人更容易看懂的 GiB。"""
+    return f"{float(num_bytes) / (1024.0**3):.2f} GiB"
+
+
+def get_cuda_memory_info() -> tuple[int, int] | None:
+    """返回当前 CUDA 设备的空闲显存和总显存，单位是字节；没有 CUDA 时返回 None。"""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=True,
+        )
+        first_line = (proc.stdout or "").strip().splitlines()[0]
+        free_mib, total_mib = [int(part.strip()) for part in first_line.split(",")[:2]]
+        return free_mib * 1024 * 1024, total_mib * 1024 * 1024
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        return int(free_bytes), int(total_bytes)
+    except Exception:
+        return None
+
+
+def ensure_enough_cuda_memory(min_free_gb: float, force_cpu: bool = False) -> None:
+    """在加载大模型前做一次显存预检，避免显存不足时把 Windows 桌面一起拖卡。"""
+    if force_cpu or min_free_gb <= 0:
+        return
+
+    info = get_cuda_memory_info()
+    if info is None:
+        return
+
+    free_bytes, total_bytes = info
+    min_free_bytes = int(float(min_free_gb) * (1024**3))
+    log(f"CUDA 显存预检: 空闲 {format_gib(free_bytes)} / 总计 {format_gib(total_bytes)}")
+    if free_bytes >= min_free_bytes:
+        return
+
+    raise GpuSafetyPrecheckError(
+        "显存不足：当前 CUDA 空闲显存只有 "
+        f"{format_gib(free_bytes)}，低于本项目的安全线 {float(min_free_gb):.1f} GiB。\n"
+        "原因解释：Qwen3-ASR 主模型、ForcedAligner 对齐模型、音频特征和生成 KV 缓存会一起占显存；"
+        "在 Windows 上显存被挤满时，桌面渲染也会受影响，所以会表现为整机卡死。\n"
+        "你现在可以这样做：关闭 ComfyUI、浏览器、游戏、视频播放器等占显存程序后重试；"
+        "或者把 MinCudaFreeGB 调低/设为 0 关闭预检；如果只是想验证流程，可以启用 ForceCpu。"
+    )
+
+
 def load_qwen_asr_model(
     asr_ckpt: str,
     aligner_ckpt: str,
@@ -417,12 +498,90 @@ def clear_cuda_cache() -> None:
         pass
 
 
+def clear_exception_frames(exc: BaseException) -> None:
+    """清理异常回溯里保留的局部变量，帮助 CUDA 张量和模型引用尽快释放。"""
+    try:
+        traceback.clear_frames(exc.__traceback__)
+    except Exception:
+        pass
+
+
+def timestamp_items(value: Any) -> list[Any]:
+    """兼容 qwen-asr 返回的 ForcedAlignResult 或普通 list/dict 时间戳结构。"""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if hasattr(value, "items") and not isinstance(value, dict):
+        try:
+            return list(value.items)
+        except TypeError:
+            pass
+    try:
+        return list(value)
+    except TypeError:
+        return []
+
+
+def split_wav_for_asr(wav_path: Path, chunk_seconds: float) -> list[tuple[Any, int, float, float]]:
+    """把 16k 单声道 wav 切成较小推理块，返回 (音频数组, 采样率, 起点秒, 时长秒)。"""
+    import numpy as np
+
+    safe_chunk_seconds = max(5.0, float(chunk_seconds or DEFAULT_CHUNK_SECONDS))
+    audio, sample_rate = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    audio_array = np.asarray(audio, dtype=np.float32)
+    if audio_array.ndim == 2:
+        audio_array = np.mean(audio_array, axis=-1).astype(np.float32)
+
+    if audio_array.size == 0:
+        return []
+
+    try:
+        from qwen_asr.inference.utils import split_audio_into_chunks
+
+        parts = split_audio_into_chunks(
+            wav=audio_array,
+            sr=int(sample_rate),
+            max_chunk_sec=safe_chunk_seconds,
+        )
+    except Exception:
+        # qwen-asr 自带的切分会尽量找低能量边界；如果它不可用，就退回固定长度切块。
+        chunk_len = max(1, int(round(safe_chunk_seconds * int(sample_rate))))
+        parts = []
+        start = 0
+        while start < int(audio_array.shape[0]):
+            end = min(int(audio_array.shape[0]), start + chunk_len)
+            parts.append((audio_array[start:end], start / float(sample_rate)))
+            start = end
+
+    out: list[tuple[Any, int, float, float]] = []
+    for chunk, offset_sec in parts:
+        chunk_array = np.asarray(chunk, dtype=np.float32)
+        duration_sec = float(chunk_array.shape[0]) / float(sample_rate) if sample_rate else 0.0
+        out.append((chunk_array, int(sample_rate), float(offset_sec), duration_sec))
+    return out
+
+
+def merge_language_labels(labels: Sequence[str | None]) -> str | None:
+    """合并分块识别到的语言标签，连续重复的标签只保留一次。"""
+    merged: list[str] = []
+    previous = ""
+    for item in labels:
+        label = str(item or "").strip()
+        if not label or label == previous:
+            continue
+        merged.append(label)
+        previous = label
+    return ",".join(merged) if merged else None
+
+
 def transcribe_with_timestamps(
     model: Any,
     wav_path: Path,
     language: str | None,
     context: str = "",
     wav_duration_sec: float = 0.0,
+    chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
     progress_interval_sec: int = 30,
     eta_rtf: float = 2.0,
 ) -> tuple[str, Sequence[Any], str | None]:
@@ -450,13 +609,58 @@ def transcribe_with_timestamps(
 
     t = threading.Thread(target=heartbeat, daemon=True)
     t.start()
+    chunk_rows = split_wav_for_asr(wav_path, chunk_seconds=chunk_seconds)
+    total_chunks = len(chunk_rows)
+    log(f"步骤 3/5: 音频已切成 {total_chunks} 块，每块最长约 {float(chunk_seconds):.0f} 秒")
+    all_text: list[str] = []
+    all_timestamps: list[dict[str, Any]] = []
+    detected_languages: list[str | None] = []
     try:
-        result = model.transcribe(
-            audio=str(wav_path),
-            language=language,
-            context=context or "",
-            return_time_stamps=True,
-        )
+        for index, (chunk_wav, sample_rate, offset_sec, duration_sec) in enumerate(chunk_rows, start=1):
+            chunk_progress = int(round(((index - 1) / max(1, total_chunks)) * 100.0))
+            log(
+                f"步骤 3/5 分块 [{index}/{total_chunks}] 开始 ASR+对齐，"
+                f"音频位置 {format_seconds_short(offset_sec)}~{format_seconds_short(offset_sec + duration_sec)}，"
+                f"进度约 {chunk_progress}%"
+            )
+            result = model.transcribe(
+                audio=(chunk_wav, sample_rate),
+                language=language,
+                context=context or "",
+                return_time_stamps=True,
+            )
+            first = result[0] if isinstance(result, (list, tuple)) else result
+            chunk_text = str(get_field(first, "text", "") or "")
+            chunk_time_stamps = get_field(first, "time_stamps", None)
+            chunk_language = get_field(first, "language", None)
+            detected_languages.append(str(chunk_language) if chunk_language else None)
+
+            if not chunk_time_stamps:
+                if chunk_text.strip():
+                    raise RuntimeError(
+                        "未拿到 time_stamps。请确认 forced aligner 模型可用，并使用 Qwen3-ForcedAligner。"
+                    )
+                log(f"步骤 3/5 分块 [{index}/{total_chunks}] 未识别到有效语音，已跳过")
+                clear_cuda_cache()
+                continue
+
+            all_text.append(chunk_text)
+            for item in timestamp_items(chunk_time_stamps):
+                text_item = str(get_field(item, "text", "") or "")
+                start_item = to_float(get_field(item, "start_time", get_field(item, "start", None)))
+                end_item = to_float(get_field(item, "end_time", get_field(item, "end", None)))
+                if not text_item or start_item is None or end_item is None:
+                    continue
+                all_timestamps.append(
+                    {
+                        "text": text_item,
+                        "start_time": round(float(start_item) + offset_sec, 3),
+                        "end_time": round(float(end_item) + offset_sec, 3),
+                    }
+                )
+            done_progress = int(round((index / max(1, total_chunks)) * 100.0))
+            log(f"步骤 3/5 分块 [{index}/{total_chunks}] 完成，进度约 {done_progress}%")
+            clear_cuda_cache()
     finally:
         done.set()
         t.join(timeout=0.1)
@@ -468,21 +672,7 @@ def transcribe_with_timestamps(
         f"{format_seconds_short(elapsed)} "
         f"(约 {speed_x:.2f}x 实时)"
     )
-    if not result:
-        return "", [], None
-
-    first = result[0] if isinstance(result, (list, tuple)) else result
-    text = str(get_field(first, "text", "") or "")
-    time_stamps = get_field(first, "time_stamps", None)
-    out_lang = get_field(first, "language", None)
-
-    if not time_stamps:
-        if not text.strip():
-            return text, [], out_lang
-        raise RuntimeError(
-            "未拿到 time_stamps。请确认 forced aligner 模型可用，并使用 Qwen3-ForcedAligner。"
-        )
-    return text, time_stamps, out_lang
+    return "".join(all_text), all_timestamps, merge_language_labels(detected_languages)
 
 
 def parse_unit_timestamps(time_stamps: Sequence[Any]) -> list[tuple[str, float, float]]:
@@ -627,9 +817,13 @@ def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
     try:
         # disable_update=True 只关闭 FunASR 的“启动时检查新版”行为，不影响标点模型本身的下载和推理。
         # 这样做可以减少每次任务启动时的联网检查时间；如果旧版 FunASR 不支持该参数，就回退到兼容写法。
-        model = AutoModel(model=punc_model_name, disable_update=True)
+        # 标点模型只处理文字，不需要占用 GPU；固定到 CPU 可以避免它继续挤占 12GB 显卡的显存。
+        model = AutoModel(model=punc_model_name, disable_update=True, device="cpu")
     except TypeError:
-        model = AutoModel(model=punc_model_name)
+        try:
+            model = AutoModel(model=punc_model_name, device="cpu")
+        except TypeError:
+            model = AutoModel(model=punc_model_name)
     output = model.generate(input=raw_text)
     text = extract_text_from_punc_result(output)
     return validate_punctuation_text(raw_text, text) if text else raw_text
@@ -936,12 +1130,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_dur", type=float, default=split_defaults["max_dur"], help="Maximum sentence duration (s)")
     parser.add_argument("--pad_left", type=float, default=split_defaults["pad_left"], help="Left padding (s)")
     parser.add_argument("--pad_right", type=float, default=split_defaults["pad_right"], help="Right padding (s)")
-    parser.add_argument("--max_new_tokens", type=int, default=2048, help="ASR max_new_tokens")
+    parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS, help="ASR max_new_tokens")
     parser.add_argument(
         "--batch_size",
         type=int,
         default=1,
         help="ASR 推理批大小。值越大通常越快，但显存占用也越高；保守值建议从 1 开始",
+    )
+    parser.add_argument(
+        "--chunk_seconds",
+        type=float,
+        default=DEFAULT_CHUNK_SECONDS,
+        help="ASR 安全分块时长，单位秒。值越小峰值显存越低，但分块数量会变多",
+    )
+    parser.add_argument(
+        "--min_cuda_free_gb",
+        type=float,
+        default=DEFAULT_MIN_CUDA_FREE_GB,
+        help="GPU 推理前要求的最低空闲显存，单位 GiB；设为 0 可关闭预检",
+    )
+    parser.add_argument(
+        "--force_cpu",
+        action="store_true",
+        help="强制使用 CPU 推理。速度会慢很多，但可用于排查 GPU 显存问题",
     )
     parser.add_argument("--eta_rtf", type=float, default=2.0, help="ETA speed assumption (x realtime)")
     parser.add_argument(
@@ -967,6 +1178,12 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     dataset_format = str(args.dataset_format or "standard").strip().lower()
     if batch_size < 1:
         raise ValueError("batch_size 必须是大于等于 1 的整数。")
+    if int(args.max_new_tokens) < 64:
+        raise ValueError("max_new_tokens 至少建议为 64；太小会导致识别文本被截断。")
+    if float(args.chunk_seconds) < 5:
+        raise ValueError("chunk_seconds 至少建议为 5 秒；太小会把一句话切得过碎，影响上下文。")
+    if float(args.min_cuda_free_gb) < 0:
+        raise ValueError("min_cuda_free_gb 不能为负数；设为 0 表示关闭显存预检。")
 
     audio_path = Path(args.audio).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else default_out_dir()
@@ -986,38 +1203,52 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     quiet_transformers_logging()
     log("步骤 2/5: 加载 Qwen3-ASR + ForcedAligner")
     log(f"ASR 批大小(batch_size): {batch_size}")
+    log(f"ASR 安全分块(chunk_seconds): {float(args.chunk_seconds):.0f} 秒")
+    log(f"ASR 最大生成(max_new_tokens): {int(args.max_new_tokens)}")
+    ensure_enough_cuda_memory(min_free_gb=float(args.min_cuda_free_gb), force_cpu=force_cpu)
     clear_cuda_cache()
-    model = load_qwen_asr_model(
-        asr_ckpt=args.asr_ckpt,
-        aligner_ckpt=args.aligner_ckpt,
-        max_new_tokens=args.max_new_tokens,
-        batch_size=batch_size,
-        force_cpu=force_cpu,
-    )
+    model = None
+    text = ""
+    time_stamps: Sequence[Any] = []
+    detected_lang: str | None = None
+    try:
+        model = load_qwen_asr_model(
+            asr_ckpt=args.asr_ckpt,
+            aligner_ckpt=args.aligner_ckpt,
+            max_new_tokens=args.max_new_tokens,
+            batch_size=batch_size,
+            force_cpu=force_cpu,
+        )
 
-    hotword_context = ""
-    hotword_file = str(args.hotword_file or "").strip()
-    if hotword_file:
-        hotword_path = Path(hotword_file).expanduser().resolve()
-        if hotword_path.exists() and hotword_path.is_file():
-            raw_lines = hotword_path.read_text(encoding="utf-8", errors="replace").strip()
-            entries = [line.strip() for line in raw_lines.splitlines() if line.strip()]
-            if entries:
-                hotword_context = "热词提示：" + "、".join(entries)
-                log(f"已加载 {len(entries)} 条热词作为识别上下文")
-        else:
-            log(f"热词文件不存在，忽略：{hotword_path}")
+        hotword_context = ""
+        hotword_file = str(args.hotword_file or "").strip()
+        if hotword_file:
+            hotword_path = Path(hotword_file).expanduser().resolve()
+            if hotword_path.exists() and hotword_path.is_file():
+                raw_lines = hotword_path.read_text(encoding="utf-8", errors="replace").strip()
+                entries = [line.strip() for line in raw_lines.splitlines() if line.strip()]
+                if entries:
+                    hotword_context = "热词提示：" + "、".join(entries)
+                    log(f"已加载 {len(entries)} 条热词作为识别上下文")
+            else:
+                log(f"热词文件不存在，忽略：{hotword_path}")
 
-    log("步骤 3/5: 执行 ASR 并获取时间戳")
-    text, time_stamps, detected_lang = transcribe_with_timestamps(
-        model=model,
-        wav_path=wav_path,
-        language=normalize_language(args.language),
-        context=hotword_context,
-        wav_duration_sec=wav_dur_sec,
-        progress_interval_sec=30,
-        eta_rtf=float(args.eta_rtf),
-    )
+        log("步骤 3/5: 执行 ASR 并获取时间戳")
+        text, time_stamps, detected_lang = transcribe_with_timestamps(
+            model=model,
+            wav_path=wav_path,
+            language=normalize_language(args.language),
+            context=hotword_context,
+            wav_duration_sec=wav_dur_sec,
+            chunk_seconds=float(args.chunk_seconds),
+            progress_interval_sec=30,
+            eta_rtf=float(args.eta_rtf),
+        )
+    finally:
+        # ASR 完成后马上释放 Qwen3-ASR + ForcedAligner，避免后面的标点模型和导出步骤继续占着显存。
+        if model is not None:
+            del model
+        clear_cuda_cache()
     log(f"识别语言: {detected_lang or 'unknown'}")
 
     warning_message = ""
@@ -1088,6 +1319,9 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
                 "language": args.language,
                 "batch_size": batch_size,
                 "requested_batch_size": int(args.batch_size),
+                "chunk_seconds": float(args.chunk_seconds),
+                "max_new_tokens": int(args.max_new_tokens),
+                "min_cuda_free_gb": float(args.min_cuda_free_gb),
                 "runtime_device": "cpu_fallback" if force_cpu else "auto",
                 "detected_language": detected_lang,
                 "punc_model": args.punc_model,
@@ -1127,22 +1361,31 @@ def main() -> int:
     requested_batch_size = int(args.batch_size)
     if requested_batch_size < 1:
         raise ValueError("batch_size 必须是大于等于 1 的整数。")
+    if bool(args.force_cpu):
+        log("已启用 ForceCpu：本次会跳过 CUDA，改用 CPU 推理。CPU 很慢，但能帮助排查显存问题。")
+        return run_pipeline(args, batch_size=requested_batch_size, force_cpu=True)
 
     try:
         return run_pipeline(args, batch_size=requested_batch_size, force_cpu=False)
     except Exception as exc:
+        if isinstance(exc, GpuSafetyPrecheckError):
+            raise
         if not is_memory_pressure_error(exc):
             raise
 
+        clear_exception_frames(exc)
         clear_cuda_cache()
         if requested_batch_size > 1:
             log("检测到显存不足，自动将 batch_size 降到 1 并重试。")
             try:
                 return run_pipeline(args, batch_size=1, force_cpu=False)
             except Exception as retry_exc:
+                if isinstance(retry_exc, GpuSafetyPrecheckError):
+                    raise
                 if not is_memory_pressure_error(retry_exc):
                     raise
 
+                clear_exception_frames(retry_exc)
                 clear_cuda_cache()
 
         try:

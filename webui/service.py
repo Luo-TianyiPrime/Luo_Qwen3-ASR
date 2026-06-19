@@ -453,12 +453,40 @@ class JobManager:
         {
             "group": "runtime",
             "key": "max_new_tokens",
-            "label": "最大生成 Token 数（不懂就默认 2048）",
+            "label": "最大生成 Token 数（不懂就默认 1024）",
             "type": "number",
             "step": 256,
             "min": 64,
-            "description": "每次 ASR 推理的最大输出 token 数。值越大 KV 缓存占显存越多",
-            "long_help": "正常语音识别输出通常在 2000 tokens 以内。如果爆显存，优先降低这个值到 1024。",
+            "description": "每个音频块最多输出多少 token。值越大越吃显存，也越可能在异常片段上拖很久",
+            "long_help": "token 可以粗略理解为模型内部的文字小片段。本项目默认 60 秒一块，1024 通常够用；如果发现片段被截断，再逐步提高到 1536 或 2048。",
+        },
+        {
+            "group": "runtime",
+            "key": "chunk_seconds",
+            "label": "安全分块秒数（12GB 建议 60）",
+            "type": "number",
+            "step": 10,
+            "min": 5,
+            "description": "长音频会先切成小块再识别。块越短，单次峰值显存越低",
+            "long_help": "这是防卡死参数。4070S 12GB 先用 60；如果仍然卡或显存紧张，试 30；16GB/24GB 显卡可以尝试 90 或 120。",
+        },
+        {
+            "group": "runtime",
+            "key": "min_cuda_free_gb",
+            "label": "最低空闲显存 GiB",
+            "type": "number",
+            "step": 0.5,
+            "min": 0,
+            "description": "GPU 推理前的安全检查线，空闲显存不够就提前报错",
+            "long_help": "Windows 桌面也吃显存。低于安全线时继续跑可能导致整机卡死；关闭 ComfyUI、游戏、浏览器视频等占显存程序后再试。设为 0 会关闭预检，不建议新手关闭。",
+        },
+        {
+            "group": "runtime",
+            "key": "force_cpu",
+            "label": "强制 CPU 推理",
+            "type": "checkbox",
+            "description": "完全不用显卡，速度会慢很多，但可用于排查是不是 GPU/显存导致卡死",
+            "long_help": "CPU 模式适合短音频验证流程，不适合大批量长音频。它仍然需要较多内存，只是不会占用 CUDA 显存。",
         },
         {
             "group": "runtime",
@@ -508,7 +536,8 @@ class JobManager:
         {
             "title": "性能与稳定性",
             "items": [
-                "batch_size 越大通常越快，但更容易触发显存不足；爆显存时先降到 1。",
+                "batch_size 越大通常越快，但更容易触发显存不足；4070S 12GB 先固定为 1。",
+                "安全分块秒数越小，单次峰值显存越低；如果整机卡顿，先从 60 改到 30。",
                 "任务执行默认 24 小时超时，超时后会自动终止，避免一直卡住。",
                 "结果列表会缓存目录变化；点“手动刷新”时才会强制重扫磁盘。",
                 "如果刚装完依赖，建议先试一个很短的音频，确认整条链路没问题。",
@@ -519,7 +548,7 @@ class JobManager:
             "items": [
                 "任务失败时先看队列里的红色提示，再看日志最后几行，通常就能定位原因。",
                 "如果提示缺少 funasr，说明旧环境缺少默认标点恢复依赖，先运行 bootstrap.ps1 -InstallFunASR。",
-                "如果提示显存不足，先把 batch_size 调到 1，再重试。",
+                "如果提示显存不足，先保持 batch_size=1，关闭其它占显存程序，再把安全分块秒数改到 30 后重试。",
                 "如果提示路径不存在，先回到“输入路径”或“参考音频”检查盘符和文件名。",
             ],
         },
@@ -661,7 +690,10 @@ class JobManager:
             "language": "None",
             "punc_model": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
             "batch_size": 1,
-            "max_new_tokens": 2048,
+            "max_new_tokens": 1024,
+            "chunk_seconds": 60.0,
+            "min_cuda_free_gb": 9.5,
+            "force_cpu": False,
             "pause_threshold": split["pause_threshold"],
             "min_dur": split["min_dur"],
             "max_dur": split["max_dur"],
@@ -897,10 +929,16 @@ class JobManager:
             "-BatchSize",
             str(int(config.get("batch_size", 1))),
             "-MaxNewTokens",
-            str(int(config.get("max_new_tokens", 2048))),
+            str(int(config.get("max_new_tokens", 1024))),
+            "-ChunkSeconds",
+            str(float(config.get("chunk_seconds", 60.0))),
+            "-MinCudaFreeGB",
+            str(float(config.get("min_cuda_free_gb", 9.5))),
             "-EtaRTF",
             str(float(config.get("eta_rtf", 2.0))),
         ]
+        if bool(config.get("force_cpu", False)):
+            cmd.append("-ForceCpu")
         ref_audio = str(config.get("ref_audio", "") or "").strip()
         if ref_audio:
             cmd.extend(["-RefAudio", ref_audio])
@@ -948,7 +986,7 @@ class JobManager:
             ("参考音频不存在" in tail or "RefAudio" in tail and "不存在" in tail, "参考音频路径有误。只有导出 Qwen3-TTS 清单时才需要它，不需要就留空。"),
             ("BatchSize 非法" in tail or "BatchSize 必须" in tail, "BatchSize 不能小于 1。新手建议先保持 1，跑通后再考虑调大。"),
             ("funasr" in lowered and "标点恢复" in tail, "你启用了标点恢复，但当前环境缺少 funasr。请先运行 `./bootstrap.ps1 -InstallFunASR`，再重新提交任务。"),
-            ("cuda out of memory" in lowered or "out of memory" in lowered or "显存不足" in tail, "显存不足。请先把 BatchSize 调到 1，关闭其它占显存程序后再试。"),
+            ("cuda out of memory" in lowered or "out of memory" in lowered or "显存不足" in tail, "显存不足。请先关闭 ComfyUI、游戏、浏览器视频等占显存程序；BatchSize 保持 1；4070S 12GB 可把安全分块秒数调到 30 后重试。"),
             ("ASR 模型目录不存在" in tail or "对齐模型目录不存在" in tail, "模型目录不存在。请先运行 `./bootstrap.ps1 -DownloadModels`，或者把模型路径改成真实存在的本地目录。"),
             ("未找到 ffmpeg" in tail or "未找到 ffprobe" in tail or ("ffmpeg" in lowered and ("not found" in lowered or "not recognized" in lowered)), "未找到 ffmpeg。音频处理需要 ffmpeg / ffprobe，请先安装并确认命令行能直接运行 `ffmpeg -version`。"),
             ("端口" in tail and "占用" in tail, "端口被占用。请关闭已有 WebUI，或者启动时换一个新的端口。"),
@@ -989,6 +1027,28 @@ class JobManager:
         if batch_size < 1:
             raise ValueError("批大小不能小于 1。0 表示不会处理任何样本，任务没法正常开始。")
         config["batch_size"] = batch_size
+
+        try:
+            max_new_tokens = int(config.get("max_new_tokens", 1024))
+        except Exception as exc:
+            raise ValueError("最大生成 Token 数必须是整数。新手建议先保持 1024。") from exc
+        if max_new_tokens < 64:
+            raise ValueError("最大生成 Token 数不能小于 64。太小会导致识别文本被截断；新手建议先保持 1024。")
+        config["max_new_tokens"] = max_new_tokens
+
+        chunk_seconds = _coerce_optional_float(config.get("chunk_seconds"), "chunk_seconds")
+        if chunk_seconds is None:
+            chunk_seconds = 60.0
+        if chunk_seconds < 5:
+            raise ValueError("安全分块秒数不能小于 5。4070S 12GB 建议先用 60；如果还卡，再试 30。")
+        config["chunk_seconds"] = chunk_seconds
+
+        min_cuda_free_gb = _coerce_optional_float(config.get("min_cuda_free_gb"), "min_cuda_free_gb")
+        if min_cuda_free_gb is None:
+            min_cuda_free_gb = 9.5
+        if min_cuda_free_gb < 0:
+            raise ValueError("最低空闲显存不能为负数。设为 0 表示关闭预检，但新手不建议关闭。")
+        config["min_cuda_free_gb"] = min_cuda_free_gb
 
         min_dur = _coerce_optional_float(config.get("min_dur"), "min_dur")
         max_dur = _coerce_optional_float(config.get("max_dur"), "max_dur")

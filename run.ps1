@@ -37,7 +37,10 @@ param(
     [double]$PadRight,
     [int]$BatchSize,
     [int]$MaxNewTokens,
+    [double]$ChunkSeconds,
+    [double]$MinCudaFreeGB,
     [double]$EtaRTF,
+    [switch]$ForceCpu,
     [switch]$ScanSubfolders,
     [switch]$ShowConfig,
     [switch]$Help
@@ -79,6 +82,10 @@ function Show-Usage {
 - RefAudio: 可选。只有导出 Qwen3-TTS 清单时才需要
 - HotwordLibrary / HotwordFile: 可选。`HotwordFile` 会优先于 `HotwordLibrary`；临时热词只影响当前任务
         - BatchSize: ASR 内部批大小。不懂就保持 1；如果爆显存，脚本会先自动降到 1，再不行会尝试 CPU 回退
+- MaxNewTokens: 每个音频块最多生成多少 token。默认 1024；如果异常音频一直卡住，不要盲目调大
+- ChunkSeconds: 长音频安全分块时长。12GB 显卡先保持 60 秒，显存紧张时可试 30 秒
+- MinCudaFreeGB: GPU 启动前最低空闲显存。默认 9.5 GiB，用来避免 Windows 桌面一起卡死
+- ForceCpu: 强制 CPU 推理。很慢，但能验证是不是显存/GPU 导致的问题
 - PauseThreshold / MinDur / MaxDur: 分句参数
 - EtaRTF: 只影响预计剩余时间的显示，不影响结果
 
@@ -91,6 +98,9 @@ function Show-Usage {
 - 导出带参考音频字段的 Qwen3-TTS 清单：./run.ps1 -DatasetFormat qwen3_tts -RefAudio ./data/ref/ref.wav
 - 使用 RAG 热词库参与识别：./run.ps1 -HotwordLibrary luo_hotwords.txt
 - 提高 ASR 并行批大小：./run.ps1 -BatchSize 4
+- 降低单次显存峰值：./run.ps1 -ChunkSeconds 30 -MaxNewTokens 768
+- 显存预检太保守时临时关闭：./run.ps1 -MinCudaFreeGB 0
+- 完全不用显卡做一次排查：./run.ps1 -ForceCpu
 - 查看帮助：./run.ps1 -Help
 
 五、常见报错
@@ -103,6 +113,7 @@ function Show-Usage {
 - 模型目录不存在：先运行 `./bootstrap.ps1 -DownloadModels`，或者把模型路径改成真实存在的本地目录
 - 标点恢复失败：默认会填写 `PuncModel`；如果提示缺少 funasr，先运行 `./bootstrap.ps1 -InstallFunASR`
 - 批大小非法：先保持 `BatchSize = 1`
+- 空闲显存不足：先关闭占显存程序；不要同时跑 ComfyUI、游戏、视频播放器或大模型推理
 
 ===========================================================
 "@ | Write-Host
@@ -266,8 +277,14 @@ function Invoke-OneAudio {
         "--pad_right", "$($Cfg.PadRight)",
         "--batch_size", "$($Cfg.BatchSize)",
         "--max_new_tokens", "$($Cfg.MaxNewTokens)",
+        "--chunk_seconds", "$($Cfg.ChunkSeconds)",
+        "--min_cuda_free_gb", "$($Cfg.MinCudaFreeGB)",
         "--eta_rtf", "$($Cfg.EtaRTF)"
     )
+
+    if ([bool]$Cfg.ForceCpu) {
+        $args += @("--force_cpu")
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($Cfg.PuncModel)) {
         $args += @("--punc_model", $Cfg.PuncModel)
@@ -383,10 +400,31 @@ $Config = [ordered]@{
     BatchSize = 1
 
     # ASR 最大生成 token 数（max_new_tokens）：
-    # - 控制每次 ASR 推理的最大输出长度，值越大 KV 缓存占用显存越多
-    # - 正常语音识别输出通常在 2000 tokens 以内
-    # - 如果显存不足，优先降低这个值（如 1024 或 2048）
-    MaxNewTokens = 2048
+    # - token 可以粗略理解为“模型内部的一小段文字单位”，不一定等于一个汉字或一个英文单词
+    # - 这个值控制每个音频块最多输出多少 token，值越大越不容易截断，但 KV 缓存越大、越吃显存
+    # - 本脚本现在默认按 60 秒分块识别，所以 1024 对普通语速通常更稳，也能减少异常音频长时间生成
+    # - 如果你发现某些 60 秒片段被截断，再逐步调到 1536 或 2048；不要一上来开很大
+    MaxNewTokens = 1024
+
+    # ASR 安全分块时长（chunk_seconds，单位秒）：
+    # - 脚本会先把长音频拆成小块，再逐块送进 Qwen3-ASR + ForcedAligner
+    # - 块越短：单次推理峰值显存越低，4070S 12GB 更不容易卡死；但块数更多，总耗时可能略变长
+    # - 块越长：上下文更完整、块数更少；但单次显存峰值更高，长音频更容易把桌面也拖卡
+    # - 12GB 显卡建议先用 60；如果你有 16GB/24GB 显卡，可以试 90 或 120
+    ChunkSeconds = 60
+
+    # GPU 启动前最低空闲显存（MinCudaFreeGB，单位 GiB）：
+    # - 这是防卡死保护，不是模型质量参数
+    # - Windows 桌面也占用同一张显卡；如果 Qwen 推理把显存挤满，鼠标/窗口/整机都可能卡住
+    # - 低于这个值时脚本会提前报错，让你先关闭 ComfyUI、浏览器、游戏、视频播放器等占显存程序
+    # - 设为 0 可以关闭预检，但不建议新手关闭
+    MinCudaFreeGB = 9.5
+
+    # 强制 CPU 推理：
+    # - false = 自动优先用 CUDA，也就是显卡
+    # - true  = 完全不用显卡，改用 CPU；会慢很多，但可用于排查“是不是显存导致卡死”
+    # - CPU 模式也需要较多内存，适合短音频验证流程，不适合大批量长音频
+    ForceCpu = $false
 
     # 分句参数（单位：秒）
     PauseThreshold = $SplitDefaults.PauseThreshold
@@ -428,12 +466,15 @@ if ($PSBoundParameters.ContainsKey("Language")) { $Config.Language = $Language }
 if ($PSBoundParameters.ContainsKey("PuncModel")) { $Config.PuncModel = $PuncModel }
 if ($PSBoundParameters.ContainsKey("BatchSize")) { $Config.BatchSize = $BatchSize }
 if ($PSBoundParameters.ContainsKey("MaxNewTokens")) { $Config.MaxNewTokens = $MaxNewTokens }
+if ($PSBoundParameters.ContainsKey("ChunkSeconds")) { $Config.ChunkSeconds = $ChunkSeconds }
+if ($PSBoundParameters.ContainsKey("MinCudaFreeGB")) { $Config.MinCudaFreeGB = $MinCudaFreeGB }
 if ($PSBoundParameters.ContainsKey("PauseThreshold")) { $Config.PauseThreshold = $PauseThreshold }
 if ($PSBoundParameters.ContainsKey("MinDur")) { $Config.MinDur = $MinDur }
 if ($PSBoundParameters.ContainsKey("MaxDur")) { $Config.MaxDur = $MaxDur }
 if ($PSBoundParameters.ContainsKey("PadLeft")) { $Config.PadLeft = $PadLeft }
 if ($PSBoundParameters.ContainsKey("PadRight")) { $Config.PadRight = $PadRight }
 if ($PSBoundParameters.ContainsKey("EtaRTF")) { $Config.EtaRTF = $EtaRTF }
+if ($PSBoundParameters.ContainsKey("ForceCpu")) { $Config.ForceCpu = $true }
 if ($PSBoundParameters.ContainsKey("ScanSubfolders")) { $Config.ScanSubfolders = $true }
 
 # ------------------ 路径归一化 ------------------
@@ -536,8 +577,16 @@ if ([int]$Config.BatchSize -lt 1) {
     throw (New-ActionableError -Problem "BatchSize 非法。" -Cause "批大小至少要是 1；填成 0、负数，或者不小心传了空值都会失败。" -NextStep "先保持 `BatchSize = 1`，跑通后再慢慢调大。")
 }
 
-if ([int]$Config.MaxNewTokens -lt 1) {
-    throw (New-ActionableError -Problem "MaxNewTokens 非法。" -Cause "最大 token 数至少要是 1；填成 0、负数，或者不小心传了空值都会失败。" -NextStep "先保持 `MaxNewTokens = 2048`，如果爆显存可以再降低到 1024。")
+if ([int]$Config.MaxNewTokens -lt 64) {
+    throw (New-ActionableError -Problem "MaxNewTokens 非法。" -Cause "最大 token 数太小会把识别文本截断；填成 0、负数，或者特别小的值都不适合 ASR。" -NextStep "先保持 `MaxNewTokens = 1024`。如果某些片段被截断，再逐步提高到 1536 或 2048。")
+}
+
+if ([double]$Config.ChunkSeconds -lt 5) {
+    throw (New-ActionableError -Problem "ChunkSeconds 非法。" -Cause "分块太短会破坏一句话的上下文，也会让任务切成大量小块。" -NextStep "12GB 显卡先保持 `ChunkSeconds = 60`；如果还卡，再试 30；不要低于 5。")
+}
+
+if ([double]$Config.MinCudaFreeGB -lt 0) {
+    throw (New-ActionableError -Problem "MinCudaFreeGB 非法。" -Cause "最低空闲显存不能为负数；这是启动前的安全检查线。" -NextStep "新手建议保持 `MinCudaFreeGB = 9.5`；设为 0 表示关闭预检，但不建议这么做。")
 }
 
 if (-not (Test-Path -LiteralPath $Config.AsrCkpt)) {
