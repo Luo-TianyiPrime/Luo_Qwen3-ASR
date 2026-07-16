@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 环境自检脚本：
 1) Python 版本与 venv
@@ -14,7 +13,6 @@ import importlib
 import platform
 import subprocess
 import sys
-from typing import Tuple
 
 
 def line(name: str, ok: bool, detail: str) -> None:
@@ -47,20 +45,25 @@ def check_ffmpeg() -> bool:
     try:
         proc = subprocess.run(
             ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=True,
+            # 自检不处理音频，正常只需瞬间打印版本；设置超时可避免损坏的 ffmpeg 进程让安装永久卡住。
+            timeout=10,
         )
         first = proc.stdout.splitlines()[0] if proc.stdout else "ffmpeg found"
         line("ffmpeg", True, first)
         return True
     except Exception as exc:
-        line("ffmpeg", False, f"未找到或无法运行 ffmpeg。请先安装 ffmpeg，并确认命令行能直接执行 ffmpeg -version。详情：{exc}")
+        line(
+            "ffmpeg",
+            False,
+            f"未找到或无法运行 ffmpeg。请先安装 ffmpeg，并确认命令行能直接执行 ffmpeg -version。详情：{exc}",
+        )
         return False
 
 
-def check_import(module_name: str, required: bool = True) -> Tuple[bool, str]:
+def check_import(module_name: str, required: bool = True) -> tuple[bool, str]:
     try:
         importlib.import_module(module_name)
         return True, "import ok"
@@ -69,7 +72,10 @@ def check_import(module_name: str, required: bool = True) -> Tuple[bool, str]:
             if module_name == "qwen_asr":
                 return False, f"核心包 qwen_asr 未安装或导入失败。请先运行 .\\bootstrap.ps1。详情：{exc}"
             if module_name == "funasr":
-                return False, f"标点恢复依赖 funasr 未安装或导入失败。请先运行 .\\bootstrap.ps1 -InstallFunASR。详情：{exc}"
+                return (
+                    False,
+                    f"标点恢复依赖 funasr 未安装或导入失败。请先运行 .\\bootstrap.ps1 -InstallFunASR。详情：{exc}",
+                )
             return False, str(exc)
         if module_name == "funasr":
             return True, "未安装 funasr（只有你手动关闭标点恢复时才可忽略；默认带标点输出需要它）"

@@ -1,4 +1,6 @@
 @echo off
+chcp 65001 >nul
+REM Switch the console to UTF-8 before cmd.exe reads the Chinese messages below.
 setlocal
 cd /d "%~dp0"
 

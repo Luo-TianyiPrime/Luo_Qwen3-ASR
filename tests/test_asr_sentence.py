@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -19,10 +21,14 @@ from asr_sentence_segment import (
     format_seconds_short,
     get_field,
     greedy_sentence_split,
+    is_unexpected_keyword_type_error,
+    merge_punc_text_to_timeline,
     normalize_punctuation_text,
+    run_pipeline,
     safe_filename_from_text,
     text_without_punctuation,
     to_float,
+    validate_runtime_args,
 )
 
 # ── CharStamp 与基础类型 ──
@@ -234,9 +240,13 @@ class TestGreedySentenceSplit:
             t = end + gap
         audio_duration = tl[-1].end if tl else 0.0
         chunks = greedy_sentence_split(
-            tl, audio_duration=audio_duration,
-            pause_threshold=0.3, min_dur=0.1, max_dur=8.0,
-            pad_left=0.05, pad_right=0.10,
+            tl,
+            audio_duration=audio_duration,
+            pause_threshold=0.3,
+            min_dur=0.1,
+            max_dur=8.0,
+            pad_left=0.05,
+            pad_right=0.10,
         )
         assert len(chunks) == 2, f"expected 2 chunks, got {len(chunks)}: {[c['text'] for c in chunks]}"
 
@@ -310,6 +320,14 @@ class TestNormalizePunctuationText:
         assert "，" in result
         assert "。" in result
 
+    def test_english_word_spaces_are_preserved(self):
+        """英文依靠空格分词，标点规范化不能把 `hello world` 粘成一个词。"""
+        assert normalize_punctuation_text("Hello world. Welcome back!") == "Hello world。Welcome back！"
+
+    def test_korean_word_spaces_are_preserved(self):
+        """现代韩文也依靠词间空格，不能因为“日韩”分类而删除。"""
+        assert normalize_punctuation_text("안녕하세요 세계!") == "안녕하세요 세계！"
+
     def test_no_change_to_correct_text(self):
         text = "大家好，欢迎回来。"
         assert normalize_punctuation_text(text) == text
@@ -336,6 +354,110 @@ class TestNormalizePunctuationText:
     def test_no_punctuation_text(self):
         text = "大家好欢迎回来"
         assert normalize_punctuation_text(text) == text
+
+
+def test_merge_punctuation_timeline_preserves_english_space():
+    """英文空格应保留在文字时间线中，但使用零时长，不能凭空拉长音频切片。"""
+    timeline = make_char_timeline(list("Hello world"), [0.1] * len("Hello world"))
+    merged = merge_punc_text_to_timeline(timeline, "Hello world.")
+    assert "".join(item.char for item in merged) == "Hello world。"
+    space = next(item for item in merged if item.char == " ")
+    assert space.start == space.end
+
+
+class TestCompatibilityTypeError:
+    def test_detects_unsupported_keyword(self):
+        exc = TypeError("got an unexpected keyword argument 'device'")
+        assert is_unexpected_keyword_type_error(exc, {"device"}) is True
+
+    def test_does_not_hide_internal_type_error(self):
+        exc = TypeError("unsupported operand type(s) for +: 'Tensor' and 'str'")
+        assert is_unexpected_keyword_type_error(exc, {"device"}) is False
+
+
+def make_runtime_args(**overrides):
+    values = {
+        "max_new_tokens": 1024,
+        "chunk_seconds": 60.0,
+        "min_cuda_free_gb": 9.0,
+        "pause_threshold": 0.6,
+        "min_dur": 0.8,
+        "max_dur": 8.0,
+        "pad_left": 0.05,
+        "pad_right": 0.1,
+        "eta_rtf": 2.0,
+    }
+    return argparse.Namespace(**{**values, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"pause_threshold": 0}, "pause_threshold"),
+        ({"min_dur": 9, "max_dur": 8}, "min_dur"),
+        ({"pad_left": -0.1}, "pad_left"),
+        ({"eta_rtf": float("nan")}, "eta_rtf"),
+    ],
+)
+def test_runtime_parameter_validation_rejects_invalid_values(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        validate_runtime_args(make_runtime_args(**overrides), batch_size=1)
+
+
+def test_punctuation_failure_is_recorded_in_meta(monkeypatch, tmp_path):
+    """标点是可选后处理：失败时 ASR 仍成功，但 meta 必须明确暴露降级，不能伪装成已应用。"""
+    audio = tmp_path / "input.wav"
+    audio.write_bytes(b"test fixture; decoding is mocked")
+    out_dir = tmp_path / "result"
+    args = argparse.Namespace(
+        audio=str(audio),
+        out_dir=str(out_dir),
+        dataset_format="standard",
+        asr_ckpt="asr",
+        aligner_ckpt="aligner",
+        language="Chinese",
+        punc_model="punc-model",
+        pause_threshold=0.6,
+        min_dur=0.1,
+        max_dur=8.0,
+        pad_left=0.0,
+        pad_right=0.0,
+        batch_size=1,
+        max_new_tokens=1024,
+        chunk_seconds=60.0,
+        min_cuda_free_gb=9.0,
+        eta_rtf=2.0,
+        ref_audio="",
+        hotword_file="",
+    )
+
+    monkeypatch.setattr("asr_sentence_segment.ffmpeg_convert_to_wav16k_mono", lambda *_: None)
+    monkeypatch.setattr("asr_sentence_segment.get_wav_duration_seconds", lambda *_: 1.0)
+    monkeypatch.setattr("asr_sentence_segment.quiet_transformers_logging", lambda: None)
+    monkeypatch.setattr("asr_sentence_segment.clear_cuda_cache", lambda: None)
+    monkeypatch.setattr("asr_sentence_segment.load_qwen_asr_model", lambda **_: object())
+    monkeypatch.setattr(
+        "asr_sentence_segment.transcribe_with_timestamps",
+        lambda **_: (
+            "你好",
+            [
+                {"text": "你", "start_time": 0.0, "end_time": 0.4},
+                {"text": "好", "start_time": 0.4, "end_time": 0.8},
+            ],
+            "Chinese",
+        ),
+    )
+    monkeypatch.setattr(
+        "asr_sentence_segment.apply_punctuation",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("simulated punctuation outage")),
+    )
+    monkeypatch.setattr("asr_sentence_segment.write_segments_and_index", lambda **kwargs: kwargs["segments"])
+
+    assert run_pipeline(args, batch_size=1, force_cpu=True) == 0
+    meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["punctuation_applied"] is False
+    assert "simulated punctuation outage" in meta["punctuation_warning"]
+    assert meta["punctuation_warning"] in meta["warning"]
 
 
 # ── text_without_punctuation ──

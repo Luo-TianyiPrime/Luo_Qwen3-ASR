@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import queue
@@ -24,7 +25,12 @@ if _scripts_dir not in sys.path:
 from shared import read_split_defaults  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_ROOT = PROJECT_ROOT / ".cache" / "webui"
+# 运行状态默认写入项目 .cache/webui。测试或多实例隔离时可设置 QWEN3_ASR_WEBUI_RUNTIME_ROOT；
+# 该变量只改变 jobs.json、日志和偏好等可再生状态，不改变模型、输入、输出或长期配置的位置。
+# 普通用户无需设置，保持默认最容易找到数据；自定义时请使用当前账号有读写权限的独立目录。
+RUNTIME_ROOT = (
+    Path(os.getenv("QWEN3_ASR_WEBUI_RUNTIME_ROOT", str(PROJECT_ROOT / ".cache" / "webui"))).expanduser().resolve()
+)
 JOB_LOG_ROOT = RUNTIME_ROOT / "logs"
 JOBS_DB_PATH = RUNTIME_ROOT / "jobs.json"
 PREFERENCES_PATH = RUNTIME_ROOT / "preferences.json"
@@ -39,6 +45,43 @@ RUN_SCRIPT_PATH = PROJECT_ROOT / "run.ps1"
 BOOTSTRAP_SCRIPT_PATH = PROJECT_ROOT / "bootstrap.ps1"
 SELF_CHECK_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "self_check.py"
 VENV_PYTHON_PATH = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+
+# JSON 标准本身不允许 // 或 # 注释，因此配置文件使用不会参与运行的 `_guide` 对象保存中文说明。
+# WebUI 加载时只读取实际配置键；保存时会重新写入这份说明，避免用户在界面保存后丢失字段解释。
+WEBUI_CONFIG_GUIDE: dict[str, Any] = {
+    "purpose": "Qwen3-ASR WebUI 任务预设。相对路径统一以项目根目录为基准，复制项目到另一台电脑后仍可使用。",
+    "beginner_notes": [
+        "第一次先使用 current_workflow.json，只把音频放入 .\\inputs；确认跑通后再一次只调整一个参数。",
+        "GiB 是显存容量单位，1 GiB=1024^3 字节；Token 是模型内部文字单位，不严格等于一个汉字或英文单词。",
+        "分块和批大小主要影响显存/速度，分句参数主要影响导出片段边界；它们不会提升原始录音本身的清晰度。",
+    ],
+    "fields": {
+        "audio": "输入音频文件或目录。推荐 .\\inputs；相对路径从项目根目录计算。",
+        "output_mode": "auto 会为每次任务建立独立时间戳目录；custom 才会使用 output_dir。新手推荐 auto。",
+        "output_dir": "自定义输出目录，仅 output_mode=custom 时生效；留空可避免覆盖或混合旧结果。",
+        "dataset_format": "standard 输出通用片段和 index.jsonl；qwen3_tts 还会生成 Qwen3-TTS 微调清单。",
+        "ref_audio": "Qwen3-TTS 清单中的可选参考音频；普通 ASR 任务留空，不是待识别音频。",
+        "hotword_library": "项目 configs/hotwords 下的热词库文件名，用于提示人名、作品名等专有词；不是强制替换词典。",
+        "hotword_text": "当前任务实际使用的临时热词正文，每行一个词；可不保存回热词库。",
+        "asr_ckpt": "ASR 主模型路径，负责把语音识别成文字；默认使用项目内 Qwen3-ASR-1.7B。",
+        "aligner_ckpt": "强制对齐模型路径，负责给文字分配时间戳，以便准确切 wav；它不是第二个转写模型。",
+        "language": "Chinese 等固定值会提供语言先验；None 表示自动检测，多语言或不确定时可用 None。",
+        "punc_model": "可选标点恢复模型，只给已识别文字补标点，不重新听音频；留空表示跳过。",
+        "batch_size": "内部推理批大小。越大可能越快也越占显存；12 GB 显卡先保持 1。",
+        "max_new_tokens": "每个音频块允许生成的最大 Token 数；过小会截断，过大会增加显存和最坏等待时间，推荐 1024。",
+        "chunk_seconds": "长音频安全分块时长（秒）。越短峰值显存越低但块更多；12 GB 显卡推荐 60。",
+        "min_cuda_free_gb": "加载模型前要求的最低空闲显存（GiB）。默认 9.0；0 会关闭保护，不建议新手使用。",
+        "force_cpu": "true 会完全绕过 CUDA，速度通常明显变慢，仅用于无 NVIDIA GPU 或排查显卡问题。",
+        "pause_threshold": "停顿超过多少秒可作为分句边界；越小越容易切短句，默认 0.6。",
+        "min_dur": "导出片段最短时长（秒），用于抑制过碎片段；必须不大于 max_dur。",
+        "max_dur": "导出片段最长目标时长（秒），用于限制超长句；必须不小于 min_dur。",
+        "pad_left": "切片向句首额外扩展的秒数，减少切掉起始音素的概率；不能为负。",
+        "pad_right": "切片向句尾额外扩展的秒数，减少切掉尾音的概率；不能为负。",
+        "eta_rtf": "预计速度的实时系数，只影响 ETA 显示，不影响识别结果；2.0 表示估计速度为实时的 2 倍。",
+        "long_audio_warning_minutes": "超过该分钟数时网页给出长任务提示，不会阻止提交；默认 120。",
+        "scan_subfolders": "true 会递归扫描输入目录的所有子目录；目录很大时文件发现和任务耗时都会增加。",
+    },
+}
 
 JOB_TIMEOUT_SECONDS = int(os.getenv("WEBUI_JOB_TIMEOUT_SECONDS", str(24 * 3600)))
 LOG_TAIL_READ_BYTES = 64 * 1024
@@ -73,7 +116,12 @@ def read_json_file(path: Path, default: Any) -> Any:
 
 
 def write_json_file(path: Path, data: Any) -> None:
-    """原子写 JSON，防止中断损坏 jobs.json。"""
+    """原子写 JSON，并兼容 Windows 杀毒软件或另一进程造成的短暂文件占用。
+
+    “原子写”是指先写临时文件，再一次性替换正式文件。这样即使程序中途退出，也不会只留下
+    半截 JSON。Windows 上 ``Path.replace`` 还可能被文件索引器、杀毒软件或另一个 WebUI
+    进程短暂拦截，因此这里做有上限的指数退避重试；超过上限仍会抛错，不会伪装成保存成功。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -81,7 +129,19 @@ def write_json_file(path: Path, data: Any) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(path)
+        replace_attempts = 6
+        for attempt in range(replace_attempts):
+            try:
+                tmp.replace(path)
+                break
+            except OSError as exc:
+                # WinError 5 是“拒绝访问”，32/33 是共享或锁冲突；它们通常只持续几十毫秒。
+                # PermissionError 在不同 Python/Windows 版本下也可能没有 winerror，所以一并重试。
+                winerror = getattr(exc, "winerror", None)
+                retryable = isinstance(exc, PermissionError) or winerror in {5, 32, 33}
+                if not retryable or attempt == replace_attempts - 1:
+                    raise
+                time.sleep(min(0.05 * (2**attempt), 0.4))
     finally:
         try:
             tmp.unlink(missing_ok=True)
@@ -239,9 +299,12 @@ def _coerce_optional_float(value: Any, field_name: str) -> float | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
-        return float(value)
+        number = float(value)
     except Exception as exc:
         raise ValueError(f"{field_name} 必须是数字") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} 必须是有限数字，不能是 NaN 或无穷大")
+    return number
 
 
 @dataclass
@@ -291,13 +354,13 @@ class JobRecord:
 
 
 class JobManager:
-    ASR_FORM_GROUPS = [
+    ASR_FORM_GROUPS: list[dict[str, Any]] = [
         {"id": "io", "title": "输入与输出", "description": "配置音频来源、输出目录与清单导出格式"},
         {"id": "models", "title": "模型与语言", "description": "配置识别模型、对齐模型、语言策略与热词"},
         {"id": "split", "title": "分句策略", "description": "控制停顿切分、句长约束与句首句尾补偿"},
         {"id": "runtime", "title": "运行与性能", "description": "控制吞吐、ETA 估算、递归扫描与长音频预警"},
     ]
-    ASR_FORM_FIELDS = [
+    ASR_FORM_FIELDS: list[dict[str, Any]] = [
         {
             "group": "io",
             "key": "audio",
@@ -328,7 +391,10 @@ class JobManager:
             "key": "dataset_format",
             "label": "输出清单格式",
             "type": "select",
-            "options": [{"value": "standard", "label": "通用 standard"}, {"value": "qwen3_tts", "label": "Qwen3-TTS qwen3_tts"}],
+            "options": [
+                {"value": "standard", "label": "通用 standard"},
+                {"value": "qwen3_tts", "label": "Qwen3-TTS qwen3_tts"},
+            ],
             "description": "standard 适合通用识别，qwen3_tts 适合后续 TTS 整理",
             "long_help": "如果只是想把音频转文字，选 standard 就够了；只有准备做 Qwen3-TTS 数据时才选 qwen3_tts。",
         },
@@ -361,7 +427,11 @@ class JobManager:
             "key": "language",
             "label": "语言策略",
             "type": "select",
-            "options": [{"value": "None", "label": "自动"}, {"value": "Chinese", "label": "中文"}, {"value": "English", "label": "英文"}],
+            "options": [
+                {"value": "None", "label": "自动"},
+                {"value": "Chinese", "label": "中文"},
+                {"value": "English", "label": "英文"},
+            ],
             "description": "None 表示自动检测语言，中文单语通常更稳",
             "long_help": "如果音频几乎都是单语，固定语言通常更稳更快；不确定就先选自动。",
         },
@@ -521,7 +591,11 @@ class JobManager:
         {"kind": "self_check", "label": "环境自检", "description": "先看 Python、ffmpeg、模型路径是否都正常"},
         {"kind": "bootstrap", "label": "安装基础依赖", "description": "创建虚拟环境并安装 PyTorch / 核心依赖"},
         {"kind": "download_models", "label": "下载模型", "description": "把 ASR / 对齐模型下载到本地 models/ 目录"},
-        {"kind": "bootstrap_funasr", "label": "补装 FunASR", "description": "默认标点恢复依赖它；旧环境缺依赖时点击这里修复"},
+        {
+            "kind": "bootstrap_funasr",
+            "label": "补装 FunASR",
+            "description": "默认标点恢复依赖它；旧环境缺依赖时点击这里修复",
+        },
     ]
     GUIDE_SECTIONS = [
         {
@@ -645,7 +719,9 @@ class JobManager:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [self._serialize_job(x) for x in sorted(self._jobs.values(), key=lambda y: y.created_at, reverse=True)]
+            return [
+                self._serialize_job(x) for x in sorted(self._jobs.values(), key=lambda y: y.created_at, reverse=True)
+            ]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -692,7 +768,8 @@ class JobManager:
             "batch_size": 1,
             "max_new_tokens": 1024,
             "chunk_seconds": 60.0,
-            "min_cuda_free_gb": 9.5,
+            # 9.0 GiB 是 12 GB 显卡的保守默认线：仍能阻止明显显存不足，同时给桌面显示占用留出余量。
+            "min_cuda_free_gb": 9.0,
             "force_cpu": False,
             "pause_threshold": split["pause_threshold"],
             "min_dur": split["min_dur"],
@@ -715,7 +792,9 @@ class JobManager:
             value = payload[key]
             try:
                 if isinstance(default, bool):
-                    out[key] = value.strip().lower() in {"1", "true", "yes", "on"} if isinstance(value, str) else bool(value)
+                    out[key] = (
+                        value.strip().lower() in {"1", "true", "yes", "on"} if isinstance(value, str) else bool(value)
+                    )
                 elif isinstance(default, int):
                     out[key] = int(value)
                 elif isinstance(default, float):
@@ -771,11 +850,18 @@ class JobManager:
         if not p.exists():
             raise FileNotFoundError(str(p))
         cfg = self.normalize_form_config(read_json_file(p, {}))
-        return {"name": p.name, "stem": p.stem, "path": str(p.resolve()), "config": cfg, "is_default": p.name == self.get_default_config_name()}
+        return {
+            "name": p.name,
+            "stem": p.stem,
+            "path": str(p.resolve()),
+            "config": cfg,
+            "is_default": p.name == self.get_default_config_name(),
+        }
 
     def save_config_file(self, name: str, payload: dict[str, Any], set_as_default: bool = False) -> dict[str, Any]:
         p = self.get_config_file_path(name)
-        write_json_file(p, self.normalize_form_config(payload))
+        # `_guide` 是给人看的说明，不会传给 ASR；每次保存都主动补回，确保配置长期可自解释。
+        write_json_file(p, {"_guide": WEBUI_CONFIG_GUIDE, **self.normalize_form_config(payload)})
         if set_as_default:
             write_json_file(DEFAULT_CONFIG_PATH, {"name": p.name})
         return self.load_config_file(p.name)
@@ -808,7 +894,14 @@ class JobManager:
         rows = []
         for p in sorted(HOTWORD_LIBRARY_ROOT.glob("*.txt"), key=lambda x: x.stat().st_mtime, reverse=True):
             content = p.read_text(encoding="utf-8", errors="replace")
-            rows.append({"name": p.name, "stem": p.stem, "path": str(p.resolve()), "entries": len(parse_hotword_entries(content))})
+            rows.append(
+                {
+                    "name": p.name,
+                    "stem": p.stem,
+                    "path": str(p.resolve()),
+                    "entries": len(parse_hotword_entries(content)),
+                }
+            )
         return rows
 
     def load_hotword_library(self, name: str) -> dict[str, Any]:
@@ -816,7 +909,13 @@ class JobManager:
         if not p.exists():
             raise FileNotFoundError(str(p))
         content = normalize_hotword_library_content(p.read_text(encoding="utf-8", errors="replace"))
-        return {"name": p.name, "stem": p.stem, "path": str(p.resolve()), "content": content, "entries": len(parse_hotword_entries(content))}
+        return {
+            "name": p.name,
+            "stem": p.stem,
+            "path": str(p.resolve()),
+            "content": content,
+            "entries": len(parse_hotword_entries(content)),
+        }
 
     def save_hotword_library(self, name: str, content: str) -> dict[str, Any]:
         p = self.get_hotword_library_path(name)
@@ -826,7 +925,9 @@ class JobManager:
         return self.load_hotword_library(p.name)
 
     def get_defaults(self) -> dict[str, Any]:
-        return self.normalize_form_config({**self.get_base_defaults(), **read_json_file(CONFIG_ROOT / self.get_default_config_name(), {})})
+        return self.normalize_form_config(
+            {**self.get_base_defaults(), **read_json_file(CONFIG_ROOT / self.get_default_config_name(), {})}
+        )
 
     def get_preferences(self) -> dict[str, Any]:
         return self.normalize_form_config({**self.get_defaults(), **read_json_file(PREFERENCES_PATH, {})})
@@ -852,7 +953,20 @@ class JobManager:
             fields.append(row)
         jobs = self.list_jobs()
         inputs_dir = PROJECT_ROOT / "inputs"
-        supported_exts = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".wma", ".webm", ".mp4", ".mkv", ".mov"}
+        supported_exts = {
+            ".wav",
+            ".mp3",
+            ".m4a",
+            ".flac",
+            ".aac",
+            ".ogg",
+            ".opus",
+            ".wma",
+            ".webm",
+            ".mp4",
+            ".mkv",
+            ".mov",
+        }
         input_audio_files = []
         if inputs_dir.exists():
             for p in sorted(inputs_dir.rglob("*")):
@@ -933,7 +1047,7 @@ class JobManager:
             "-ChunkSeconds",
             str(float(config.get("chunk_seconds", 60.0))),
             "-MinCudaFreeGB",
-            str(float(config.get("min_cuda_free_gb", 9.5))),
+            str(float(config.get("min_cuda_free_gb", 9.0))),
             "-EtaRTF",
             str(float(config.get("eta_rtf", 2.0))),
         ]
@@ -978,17 +1092,52 @@ class JobManager:
         lowered = tail.lower()
 
         rules: list[tuple[bool, str]] = [
-            ("未找到虚拟环境" in tail or ".venv" in tail and "not found" in lowered, "未找到虚拟环境。你可能还没有执行初始化。请先运行 `./bootstrap.ps1`，完成后再重新提交任务。"),
-            ("未找到主脚本" in tail or "asr_sentence_segment.py" in tail and "not found" in lowered, "主脚本没找到。请确认当前就是项目根目录，或者重新解压完整项目后再试。"),
-            ("Audio 为空" in tail or "输入路径为空" in tail, "输入路径为空。请先保留默认的 `./inputs`，或者填写一个真实存在的音频文件 / 文件夹。"),
-            ("输入路径不存在" in tail or "输入路径既不是文件也不是目录" in tail, "输入路径不对。最常见原因是盘符写错、路径复制漏了，或者文件还没放进项目里。"),
-            ("目录下未找到可处理音频" in tail or "输入目录里没有找到可处理音频" in tail, "输入目录里没有可处理的音频。请把音频放进 `./inputs`，或者换成正确的音频目录。"),
-            ("参考音频不存在" in tail or "RefAudio" in tail and "不存在" in tail, "参考音频路径有误。只有导出 Qwen3-TTS 清单时才需要它，不需要就留空。"),
-            ("BatchSize 非法" in tail or "BatchSize 必须" in tail, "BatchSize 不能小于 1。新手建议先保持 1，跑通后再考虑调大。"),
-            ("funasr" in lowered and "标点恢复" in tail, "你启用了标点恢复，但当前环境缺少 funasr。请先运行 `./bootstrap.ps1 -InstallFunASR`，再重新提交任务。"),
-            ("cuda out of memory" in lowered or "out of memory" in lowered or "显存不足" in tail, "显存不足。请先关闭 ComfyUI、游戏、浏览器视频等占显存程序；BatchSize 保持 1；4070S 12GB 可把安全分块秒数调到 30 后重试。"),
-            ("ASR 模型目录不存在" in tail or "对齐模型目录不存在" in tail, "模型目录不存在。请先运行 `./bootstrap.ps1 -DownloadModels`，或者把模型路径改成真实存在的本地目录。"),
-            ("未找到 ffmpeg" in tail or "未找到 ffprobe" in tail or ("ffmpeg" in lowered and ("not found" in lowered or "not recognized" in lowered)), "未找到 ffmpeg。音频处理需要 ffmpeg / ffprobe，请先安装并确认命令行能直接运行 `ffmpeg -version`。"),
+            (
+                "未找到虚拟环境" in tail or ".venv" in tail and "not found" in lowered,
+                "未找到虚拟环境。你可能还没有执行初始化。请先运行 `./bootstrap.ps1`，完成后再重新提交任务。",
+            ),
+            (
+                "未找到主脚本" in tail or "asr_sentence_segment.py" in tail and "not found" in lowered,
+                "主脚本没找到。请确认当前就是项目根目录，或者重新解压完整项目后再试。",
+            ),
+            (
+                "Audio 为空" in tail or "输入路径为空" in tail,
+                "输入路径为空。请先保留默认的 `./inputs`，或者填写一个真实存在的音频文件 / 文件夹。",
+            ),
+            (
+                "输入路径不存在" in tail or "输入路径既不是文件也不是目录" in tail,
+                "输入路径不对。最常见原因是盘符写错、路径复制漏了，或者文件还没放进项目里。",
+            ),
+            (
+                "目录下未找到可处理音频" in tail or "输入目录里没有找到可处理音频" in tail,
+                "输入目录里没有可处理的音频。请把音频放进 `./inputs`，或者换成正确的音频目录。",
+            ),
+            (
+                "参考音频不存在" in tail or "RefAudio" in tail and "不存在" in tail,
+                "参考音频路径有误。只有导出 Qwen3-TTS 清单时才需要它，不需要就留空。",
+            ),
+            (
+                "BatchSize 非法" in tail or "BatchSize 必须" in tail,
+                "BatchSize 不能小于 1。新手建议先保持 1，跑通后再考虑调大。",
+            ),
+            (
+                "funasr" in lowered and "标点恢复" in tail,
+                "你启用了标点恢复，但当前环境缺少 funasr。请先运行 `./bootstrap.ps1 -InstallFunASR`，再重新提交任务。",
+            ),
+            (
+                "cuda out of memory" in lowered or "out of memory" in lowered or "显存不足" in tail,
+                "显存不足。请先关闭 ComfyUI、游戏、浏览器视频等占显存程序；BatchSize 保持 1；4070S 12GB 可把安全分块秒数调到 30 后重试。",
+            ),
+            (
+                "ASR 模型目录不存在" in tail or "对齐模型目录不存在" in tail,
+                "模型目录不存在。请先运行 `./bootstrap.ps1 -DownloadModels`，或者把模型路径改成真实存在的本地目录。",
+            ),
+            (
+                "未找到 ffmpeg" in tail
+                or "未找到 ffprobe" in tail
+                or ("ffmpeg" in lowered and ("not found" in lowered or "not recognized" in lowered)),
+                "未找到 ffmpeg。音频处理需要 ffmpeg / ffprobe，请先安装并确认命令行能直接运行 `ffmpeg -version`。",
+            ),
             ("端口" in tail and "占用" in tail, "端口被占用。请关闭已有 WebUI，或者启动时换一个新的端口。"),
         ]
 
@@ -1045,7 +1194,7 @@ class JobManager:
 
         min_cuda_free_gb = _coerce_optional_float(config.get("min_cuda_free_gb"), "min_cuda_free_gb")
         if min_cuda_free_gb is None:
-            min_cuda_free_gb = 9.5
+            min_cuda_free_gb = 9.0
         if min_cuda_free_gb < 0:
             raise ValueError("最低空闲显存不能为负数。设为 0 表示关闭预检，但新手不建议关闭。")
         config["min_cuda_free_gb"] = min_cuda_free_gb
@@ -1055,6 +1204,11 @@ class JobManager:
         pad_left = _coerce_optional_float(config.get("pad_left"), "pad_left")
         pad_right = _coerce_optional_float(config.get("pad_right"), "pad_right")
         pause_threshold = _coerce_optional_float(config.get("pause_threshold"), "pause_threshold")
+        eta_rtf = _coerce_optional_float(config.get("eta_rtf"), "eta_rtf")
+        if min_dur is not None and min_dur < 0:
+            raise ValueError("最短句时长不能为负数。新手建议保持 0.8 秒。")
+        if max_dur is not None and max_dur <= 0:
+            raise ValueError("最长句时长必须大于 0。新手建议保持 8 秒。")
         if min_dur is not None and max_dur is not None and min_dur > max_dur:
             raise ValueError(f"最短句时长不能大于最长句时长。当前 min_dur={min_dur}，max_dur={max_dur}。")
         if pad_left is not None and pad_left < 0:
@@ -1063,19 +1217,35 @@ class JobManager:
             raise ValueError("右补边不能为负数。先保持 0 或用很小的正数就行。")
         if pause_threshold is not None and pause_threshold <= 0:
             raise ValueError("停顿阈值必须大于 0。新手一般直接用默认值即可。")
+        if eta_rtf is not None and eta_rtf <= 0:
+            raise ValueError("ETA 实时系数必须大于 0。它只影响剩余时间估算，新手建议保持 2.0。")
+        config.update(
+            {
+                "min_dur": min_dur,
+                "max_dur": max_dur,
+                "pad_left": pad_left,
+                "pad_right": pad_right,
+                "pause_threshold": pause_threshold,
+                "eta_rtf": eta_rtf,
+            }
+        )
 
         audio_value = str(config.get("audio", "") or "").strip()
         if not audio_value:
             raise ValueError("输入路径为空。请先填写一个音频文件或文件夹，第一次建议直接用 .\\inputs。")
         audio_path = resolve_project_path(audio_value)
         if not audio_path.exists():
-            raise ValueError(f"输入路径不存在：{audio_path}。最常见原因是盘符写错、文件还没放进来，或者相对路径不是项目根目录。")
+            raise ValueError(
+                f"输入路径不存在：{audio_path}。最常见原因是盘符写错、文件还没放进来，或者相对路径不是项目根目录。"
+            )
 
         ref_audio = str(config.get("ref_audio", "") or "").strip()
         if ref_audio:
             ref_audio_path = resolve_project_path(ref_audio)
             if not ref_audio_path.exists() or not ref_audio_path.is_file():
-                raise ValueError(f"参考音频不存在或不是文件：{ref_audio_path}。如果你不是在导出 Qwen3-TTS 清单，就把它留空。")
+                raise ValueError(
+                    f"参考音频不存在或不是文件：{ref_audio_path}。如果你不是在导出 Qwen3-TTS 清单，就把它留空。"
+                )
 
         output_mode = str(config.get("output_mode", "auto") or "auto")
         if output_mode == "custom" and str(config.get("output_dir", "") or "").strip():
@@ -1087,7 +1257,9 @@ class JobManager:
         if output_mode == "auto":
             output_dir = build_auto_output_dir(job_id, audio_value)
 
-        long_audio_warning_minutes = _coerce_optional_float(config.get("long_audio_warning_minutes"), "long_audio_warning_minutes")
+        long_audio_warning_minutes = _coerce_optional_float(
+            config.get("long_audio_warning_minutes"), "long_audio_warning_minutes"
+        )
         if long_audio_warning_minutes is None:
             long_audio_warning_minutes = 120.0
         if long_audio_warning_minutes <= 0:
@@ -1110,7 +1282,9 @@ class JobManager:
                 runtime_hotword_file = str(runtime_path.resolve())
                 hotword_tmp_path = runtime_path
 
-            cmd = self._build_asr_command({**config, "audio": str(audio_path), "hotword_file": runtime_hotword_file}, output_dir)
+            cmd = self._build_asr_command(
+                {**config, "audio": str(audio_path), "hotword_file": runtime_hotword_file}, output_dir
+            )
             title = str(raw_payload.get("title", "") or "").strip() or infer_title_from_audio(audio_value)
             log_path = JOB_LOG_ROOT / f"{job_id}.log"
             rec = JobRecord(
@@ -1119,7 +1293,11 @@ class JobManager:
                 title=title,
                 status="queued",
                 created_at=now_iso(),
-                config={**config, "output_mode": output_mode, "hotword_entries": len(parse_hotword_entries(hotword_text))},
+                config={
+                    **config,
+                    "output_mode": output_mode,
+                    "hotword_entries": len(parse_hotword_entries(hotword_text)),
+                },
                 command=cmd,
                 output_dir=str(output_dir.resolve()),
                 log_path=str(log_path.resolve()),
@@ -1148,17 +1326,49 @@ class JobManager:
         log_path = JOB_LOG_ROOT / f"{job_id}.log"
         if kind == "bootstrap":
             title = "安装基础依赖"
-            cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BOOTSTRAP_SCRIPT_PATH.resolve())]
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(BOOTSTRAP_SCRIPT_PATH.resolve()),
+            ]
         elif kind == "download_models":
             title = "下载模型"
-            cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BOOTSTRAP_SCRIPT_PATH.resolve()), "-DownloadModels"]
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(BOOTSTRAP_SCRIPT_PATH.resolve()),
+                "-DownloadModels",
+            ]
         elif kind == "bootstrap_funasr":
             title = "补装 FunASR"
-            cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(BOOTSTRAP_SCRIPT_PATH.resolve()), "-InstallFunASR"]
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(BOOTSTRAP_SCRIPT_PATH.resolve()),
+                "-InstallFunASR",
+            ]
         else:
             title = "环境自检"
             cmd = [str(VENV_PYTHON_PATH.resolve()), str(SELF_CHECK_SCRIPT_PATH.resolve())]
-        rec = JobRecord(id=job_id, kind=kind, title=title, status="queued", created_at=now_iso(), command=cmd, log_path=str(log_path.resolve()), progress_label="等待前序任务完成后开始")
+        rec = JobRecord(
+            id=job_id,
+            kind=kind,
+            title=title,
+            status="queued",
+            created_at=now_iso(),
+            command=cmd,
+            log_path=str(log_path.resolve()),
+            progress_label="等待前序任务完成后开始",
+        )
         with self._lock:
             self._jobs[job_id] = rec
             self._pending_ids.append(job_id)
@@ -1285,7 +1495,16 @@ class JobManager:
                 if job.output_dir:
                     self._append_log(log_handle, f"[webui] 结果目录：{job.output_dir}")
                 try:
-                    process = subprocess.Popen(job.command, cwd=str(PROJECT_ROOT.resolve()), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env)
+                    process = subprocess.Popen(
+                        job.command,
+                        cwd=str(PROJECT_ROOT.resolve()),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        env=env,
+                    )
                 except Exception as exc:
                     with self._lock:
                         job.status = "failed"
@@ -1316,14 +1535,15 @@ class JobManager:
                     exit_code = process.wait(timeout=JOB_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    self._append_log(log_handle, f"[webui] 任务超时（{JOB_TIMEOUT_SECONDS // 3600}小时），已强制终止进程")
+                    self._append_log(
+                        log_handle, f"[webui] 任务超时（{JOB_TIMEOUT_SECONDS // 3600}小时），已强制终止进程"
+                    )
                     self._terminate_process_tree(process)
                     try:
                         exit_code = process.wait(timeout=30)
                     except subprocess.TimeoutExpired:
-                        exit_code = process.poll()
-                        if exit_code is None:
-                            exit_code = -1
+                        polled_exit_code = process.poll()
+                        exit_code = -1 if polled_exit_code is None else polled_exit_code
                 reader.join(timeout=5)
 
                 with self._lock:
@@ -1377,8 +1597,47 @@ class JobManager:
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
-            self._run_job(job_id)
-            self._queue.task_done()
+            try:
+                self._run_job(job_id)
+            except Exception as exc:
+                # 单个任务遇到预料外异常时不能让唯一的后台工作线程退出，否则后续任务会永久停在“排队中”。
+                # 这里把异常落到任务状态和日志中；KeyboardInterrupt/SystemExit 不属于 Exception，仍交给进程处理。
+                self._record_unhandled_worker_error(job_id, exc)
+            finally:
+                # Queue 的 unfinished_tasks 计数必须始终归还，否则测试或关闭流程中的 join() 会永远等待。
+                self._queue.task_done()
+
+    def _record_unhandled_worker_error(self, job_id: str, exc: Exception) -> None:
+        """记录执行器边界处的意外异常，同时尽力保持工作线程可以继续处理下一项任务。"""
+        message = f"任务执行器遇到未处理异常：{type(exc).__name__}: {exc}"
+        log_path: Path | None = None
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.status = "failed"
+                job.finished_at = now_iso()
+                job.exit_code = -1
+                job.error = message
+                job.progress_label = "任务执行器异常，请查看日志"
+                job.progress_value = min(float(job.progress_value), 98.0)
+                log_path = Path(job.log_path) if job.log_path else None
+            self._running_job_id = None
+            self._cancelled_job_ids.discard(job_id)
+            try:
+                self._save_jobs()
+            except OSError:
+                # 如果根因就是磁盘暂时不可写，不能让错误记录动作再次杀死工作线程。
+                # write_json_file 已经完成重试；这里保留内存中的失败状态，下一次正常保存会再次写入。
+                pass
+
+        if log_path is not None:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8", newline="\n") as handle:
+                    self._append_log(handle, f"[webui] {message}")
+            except OSError:
+                pass
+        self._cleanup_hotword_runtime_file(job_id)
 
     def _result_dirs_for_root(self, output_root: Path) -> list[Path]:
         root = output_root.resolve()
@@ -1407,7 +1666,9 @@ class JobManager:
         return {
             "id": make_result_id(run_dir),
             "run_dir": str(run_dir.resolve()),
-            "relative_run_dir": str(run_dir.resolve().relative_to(PROJECT_ROOT.resolve())) if PROJECT_ROOT.resolve() in run_dir.resolve().parents else str(run_dir.resolve()),
+            "relative_run_dir": str(run_dir.resolve().relative_to(PROJECT_ROOT.resolve()))
+            if PROJECT_ROOT.resolve() in run_dir.resolve().parents
+            else str(run_dir.resolve()),
             "updated_at": datetime.fromtimestamp(run_dir.stat().st_mtime).astimezone().isoformat(),
             "title": str(meta.get("title", run_dir.name)) if isinstance(meta, dict) else run_dir.name,
             "warning": warning,
@@ -1419,7 +1680,11 @@ class JobManager:
         return [self._summarize_result_dir(p) for p in self._result_dirs_for_root(output_root)]
 
     def list_results(self, refresh: bool = False) -> list[dict[str, Any]]:
-        if not refresh and self._results_cache is not None and (time.time() - self._results_cache_time) < RESULTS_CACHE_TTL_SECONDS:
+        if (
+            not refresh
+            and self._results_cache is not None
+            and (time.time() - self._results_cache_time) < RESULTS_CACHE_TTL_SECONDS
+        ):
             return list(self._results_cache)
         roots: dict[str, Path] = {str(WEBUI_OUTPUT_ROOT.resolve()): WEBUI_OUTPUT_ROOT.resolve()}
         with self._lock:
@@ -1445,7 +1710,14 @@ class JobManager:
         artifacts = []
         for p in sorted(run_dir.rglob("*")):
             if p.is_file():
-                artifacts.append({"name": p.name, "relative_path": str(p.relative_to(run_dir)).replace("\\", "/"), "size": p.stat().st_size, "media_type": guess_media_type(p)})
+                artifacts.append(
+                    {
+                        "name": p.name,
+                        "relative_path": str(p.relative_to(run_dir)).replace("\\", "/"),
+                        "size": p.stat().st_size,
+                        "media_type": guess_media_type(p),
+                    }
+                )
         detail = dict(summary)
         detail["meta"] = meta if isinstance(meta, dict) else {}
         detail["warning"] = str(detail["meta"].get("warning", "") or detail.get("warning", ""))
@@ -1462,7 +1734,9 @@ class JobManager:
             raise FileNotFoundError(str(target))
         return target
 
-    def export_qwen3_tts_dataset(self, result_id: str, ref_audio: str | None = None, output_dir: str | None = None) -> dict[str, Any]:
+    def export_qwen3_tts_dataset(
+        self, result_id: str, ref_audio: str | None = None, output_dir: str | None = None
+    ) -> dict[str, Any]:
         result = self.get_result(result_id)
         run_dir = Path(result["run_dir"]).resolve()
         dst_root = resolve_project_path(output_dir or str(run_dir / "exports"))

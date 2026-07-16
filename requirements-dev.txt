@@ -1,0 +1,8 @@
+# 开发与质量检查依赖，不参与正常 ASR/WebUI 运行。
+# 新手说明：requirements.txt 是“运行项目需要什么”，本文件是“修改代码后如何做自动检查”。
+# 不固定补丁版本是为了兼容 Python 3.10/3.11；正式发布部署包前应在隔离环境中重新跑完整测试。
+ruff
+pytest
+mypy
+# FastAPI 的 TestClient 通过 httpx 模拟 HTTP 请求，用来验证前后端 JSON 契约而不启动真实端口。
+httpx

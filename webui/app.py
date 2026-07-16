@@ -31,6 +31,17 @@ class PreferencesPayload(BaseModel):
     pad_left: float | None = None
     pad_right: float | None = None
     batch_size: int | None = None
+    # 最大生成 Token 数：Token 是模型内部处理文本的基本单位，不完全等于“一个汉字”。
+    # 这个值过小会截断长句，过大则会增加显存占用和最坏情况下的等待时间；入门用户建议保持 1024。
+    max_new_tokens: int | None = None
+    # 安全分块秒数：长音频会先按该时长切成较小块再送入模型，用来控制峰值显存。
+    # 60 秒适合多数 12 GB 显卡；如果仍然显存不足，可逐步降到 30 秒或 15 秒。
+    chunk_seconds: float | None = None
+    # 启动前要求的最低空闲显存（GiB）。这里的 GiB 是 1024^3 字节，不是硬盘厂商常用的十进制 GB。
+    # 设为 0 会关闭预检，可能让任务在模型加载到一半时才因显存不足失败，因此不建议新手关闭。
+    min_cuda_free_gb: float | None = None
+    # 强制使用 CPU：仅用于没有可用 CUDA 显卡或排查显卡问题；速度通常会明显慢于 NVIDIA GPU。
+    force_cpu: bool | None = None
     eta_rtf: float | None = None
     long_audio_warning_minutes: int | None = None
     scan_subfolders: bool | None = None
@@ -56,6 +67,12 @@ class AsrJobPayload(BaseModel):
     pad_left: float = 0.05
     pad_right: float = 0.10
     batch_size: int = 1
+    # 以下四项必须显式列在请求模型中。Pydantic 默认会忽略未声明字段；如果漏写，网页看似提交成功，
+    # 但用户填写的值会被静默丢弃，任务仍使用后端默认值。
+    max_new_tokens: int = 1024
+    chunk_seconds: float = 60.0
+    min_cuda_free_gb: float = 9.0
+    force_cpu: bool = False
     eta_rtf: float = 2.0
     long_audio_warning_minutes: int = 120
     scan_subfolders: bool = False
@@ -68,6 +85,11 @@ class ExportQwen3TtsPayload(BaseModel):
 
 class OpenPathPayload(BaseModel):
     path: str
+
+
+class OpenSystemPathPayload(BaseModel):
+    # 只允许打开项目预先定义的四个目录，不接受任意文件系统路径，避免网页误开敏感位置。
+    target: Literal["project", "inputs", "outputs", "webui_outputs"]
 
 
 class ConfigFileLoadPayload(BaseModel):
@@ -250,7 +272,9 @@ def create_asr_job(payload: AsrJobPayload) -> dict[str, object]:
 
 
 @app.post("/api/jobs/actions/{kind}")
-def create_action_job(kind: Literal["bootstrap", "download_models", "bootstrap_funasr", "self_check"]) -> dict[str, object]:
+def create_action_job(
+    kind: Literal["bootstrap", "download_models", "bootstrap_funasr", "self_check"],
+) -> dict[str, object]:
     try:
         job = manager.create_maintenance_job(kind)
     except ValueError as exc:
@@ -372,7 +396,7 @@ def export_result_qwen3_tts(result_id: str, payload: ExportQwen3TtsPayload) -> d
 
 
 @app.post("/api/system/open")
-def open_system_path(target: Literal["project", "inputs", "outputs", "webui_outputs"]) -> dict[str, bool]:
+def open_system_path(payload: OpenSystemPathPayload) -> dict[str, bool]:
     mapping = {
         "project": PROJECT_ROOT,
         "inputs": PROJECT_ROOT / "inputs",
@@ -381,7 +405,7 @@ def open_system_path(target: Literal["project", "inputs", "outputs", "webui_outp
     }
 
     try:
-        manager.open_path_in_explorer(str(mapping[target]))
+        manager.open_path_in_explorer(str(mapping[payload.target]))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except FileNotFoundError as exc:

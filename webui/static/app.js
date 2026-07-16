@@ -2,6 +2,9 @@
 const TOAST_DURATION_MS = 3000;
 const JOBS_POLL_INTERVAL_MS = 2500;
 const RESULTS_POLL_INTERVAL_MS = 5000;
+// 普通 API 请求 15 秒仍未响应时主动中止。ASR 长任务本身在后台运行，不依赖这个 HTTP 请求一直保持连接。
+// 这样后端意外退出时，按钮不会永久停在“提交中”；轮询也能在下一轮自动恢复。
+const REQUEST_TIMEOUT_MS = 15000;
 const AUDIO_PREVIEW_LIMIT = 12;
 const ARTIFACT_LIST_LIMIT = 80;
 const RESULT_PREVIEW_CHARS = 300;
@@ -24,6 +27,8 @@ const state = {
   hotwordLibraryLoaded: null,
   hotwordLibraryOriginalText: "",
   submitting: false,
+  jobsRefreshing: false,
+  resultsRefreshing: false,
 };
 
 const el = {
@@ -127,22 +132,40 @@ function toast(message, type = "") {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  if (!response.ok) {
-    let detail = `请求失败（${response.status}）`;
-    try {
-      const payload = await response.json();
-      if (payload.detail) detail = payload.detail;
-    } catch {
-      // ignore
+  const { timeoutMs = REQUEST_TIMEOUT_MS, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const externalSignal = fetchOptions.signal;
+  const abortFromCaller = () => controller.abort(externalSignal?.reason);
+  if (externalSignal) externalSignal.addEventListener("abort", abortFromCaller, { once: true });
+  const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      let detail = `请求失败（${response.status}）`;
+      try {
+        const payload = await response.json();
+        if (payload.detail) detail = payload.detail;
+      } catch {
+        // 响应不是 JSON 时保留包含 HTTP 状态码的通用提示。
+      }
+      throw new Error(detail);
     }
-    throw new Error(detail);
+    const contentType = response.headers.get("Content-Type") || "";
+    return contentType.includes("application/json") ? response.json() : response.text();
+  } catch (error) {
+    if (controller.signal.aborted && !externalSignal?.aborted) {
+      throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒仍未响应，请确认 WebUI 后端仍在运行。`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    if (externalSignal) externalSignal.removeEventListener("abort", abortFromCaller);
   }
-  const contentType = response.headers.get("Content-Type") || "";
-  return contentType.includes("application/json") ? response.json() : response.text();
 }
 
 function statusLabel(status) {
@@ -474,13 +497,20 @@ async function runQuickAction(kind) {
 }
 
 async function refreshJobs() {
-  const payload = await request("/api/jobs");
-  state.jobs = payload.jobs || [];
-  if (!state.selectedJobId && state.jobs.length) state.selectedJobId = state.jobs[0].id;
-  if (state.selectedJobId && !state.jobs.some((x) => x.id === state.selectedJobId)) {
-    state.selectedJobId = state.jobs[0]?.id || null;
+  if (state.jobsRefreshing) return;
+  state.jobsRefreshing = true;
+  try {
+    const payload = await request("/api/jobs");
+    state.jobs = payload.jobs || [];
+    if (!state.selectedJobId && state.jobs.length) state.selectedJobId = state.jobs[0].id;
+    if (state.selectedJobId && !state.jobs.some((x) => x.id === state.selectedJobId)) {
+      state.selectedJobId = state.jobs[0]?.id || null;
+    }
+    renderJobs();
+  } finally {
+    // setInterval 不会等待上一次 Promise。用标志位禁止慢请求重叠，避免旧响应覆盖较新的页面状态。
+    state.jobsRefreshing = false;
   }
-  renderJobs();
 }
 
 async function submitTask() {
@@ -530,25 +560,31 @@ async function openSelectedOutput() {
 }
 
 async function refreshResults(force = false) {
-  const previousSelectedId = state.selectedResultId;
-  const previousSelected = state.results.find((x) => x.id === previousSelectedId) || null;
-  const query = force ? "?refresh=1" : "";
-  const payload = await request(`/api/results${query}`);
-  state.results = payload.results || [];
-  if (!state.selectedResultId && state.results.length) state.selectedResultId = state.results[0].id;
-  if (state.selectedResultId && !state.results.some((x) => x.id === state.selectedResultId)) {
-    state.selectedResultId = state.results[0]?.id || null;
-  }
-  const selectionChanged = previousSelectedId !== state.selectedResultId;
-  const currentSelected = state.results.find((x) => x.id === state.selectedResultId) || null;
-  const selectedUpdated = Boolean(previousSelected && currentSelected && previousSelected.updated_at !== currentSelected.updated_at);
-  renderResults();
-  if (!state.selectedResultId) {
-    renderResultDetail(false).catch((e) => toast(e.message, "error"));
-    return;
-  }
-  if (force || selectionChanged || selectedUpdated || !state.resultDetailCache[state.selectedResultId]) {
-    await renderResultDetail(force || selectionChanged || selectedUpdated);
+  if (state.resultsRefreshing) return;
+  state.resultsRefreshing = true;
+  try {
+    const previousSelectedId = state.selectedResultId;
+    const previousSelected = state.results.find((x) => x.id === previousSelectedId) || null;
+    const query = force ? "?refresh=1" : "";
+    const payload = await request(`/api/results${query}`);
+    state.results = payload.results || [];
+    if (!state.selectedResultId && state.results.length) state.selectedResultId = state.results[0].id;
+    if (state.selectedResultId && !state.results.some((x) => x.id === state.selectedResultId)) {
+      state.selectedResultId = state.results[0]?.id || null;
+    }
+    const selectionChanged = previousSelectedId !== state.selectedResultId;
+    const currentSelected = state.results.find((x) => x.id === state.selectedResultId) || null;
+    const selectedUpdated = Boolean(previousSelected && currentSelected && previousSelected.updated_at !== currentSelected.updated_at);
+    renderResults();
+    if (!state.selectedResultId) {
+      renderResultDetail(false).catch((e) => toast(e.message, "error"));
+      return;
+    }
+    if (force || selectionChanged || selectedUpdated || !state.resultDetailCache[state.selectedResultId]) {
+      await renderResultDetail(force || selectionChanged || selectedUpdated);
+    }
+  } finally {
+    state.resultsRefreshing = false;
   }
 }
 
@@ -756,8 +792,10 @@ async function loadHotwordLibraryContent(libraryName, textarea) {
     // 更新 textarea DOM 显示
     const ta = textarea || document.getElementById("field-hotword_text");
     if (ta) ta.value = content;
+    return true;
   } catch (e) {
     toast(e.message, "error");
+    return false;
   }
 }
 
@@ -846,8 +884,7 @@ async function handleHotwordLibraryChange(newValue) {
   }
 
   // 加载新热词库内容到 textarea
-  await loadHotwordLibraryContent(newValue, textarea);
-  return true;
+  return loadHotwordLibraryContent(newValue, textarea);
 }
 
 // ----------------------------------------------------------
@@ -872,8 +909,12 @@ async function saveHotwordContent() {
     }),
   });
   // 保存成功后同步状态：更新原始内容基准，后续不再提示脏数据
-  state.hotwordLibraryOriginalText = textarea.value;
-  state.form.hotword_text = textarea.value;
+  // 服务端会清理空行和重复词，必须用服务端实际写入的规范化文本作为新基准，
+  // 否则保存后 textarea 仍会被误判为“有未保存修改”。
+  const savedContent = result.library.content;
+  textarea.value = savedContent;
+  state.hotwordLibraryOriginalText = savedContent;
+  state.form.hotword_text = savedContent;
   return result;
 }
 
@@ -1025,8 +1066,8 @@ async function init() {
     el.openProjectBtn.addEventListener("click", () => openSystemPath("project").catch((e) => toast(e.message, "error")));
     el.openOutputsBtn.addEventListener("click", () => openSystemPath("outputs").catch((e) => toast(e.message, "error")));
 
-  setInterval(() => refreshJobs().catch(() => {}), JOBS_POLL_INTERVAL_MS);
-  setInterval(() => refreshResults(false).catch(() => {}), RESULTS_POLL_INTERVAL_MS);
+    setInterval(() => refreshJobs().catch(() => {}), JOBS_POLL_INTERVAL_MS);
+    setInterval(() => refreshResults(false).catch(() => {}), RESULTS_POLL_INTERVAL_MS);
   } catch (error) {
     toast(error.message || String(error), "error");
   }

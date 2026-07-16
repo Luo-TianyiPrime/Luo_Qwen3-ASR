@@ -9,6 +9,7 @@ import argparse
 import gc
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -40,7 +41,9 @@ logger.propagate = False
 # - MIN_CUDA_FREE_GB：启动 GPU 推理前要求至少有多少空闲显存；不够就直接报错，避免 Windows 桌面一起卡死。
 DEFAULT_CHUNK_SECONDS = 60.0
 DEFAULT_MAX_NEW_TOKENS = 1024
-DEFAULT_MIN_CUDA_FREE_GB = 9.5
+# 实机回归中，RTX 4070 SUPER 在仅承担 Windows 桌面显示时空闲约 9.48 GiB；9.5 GiB 会因几十 MiB
+# 的正常波动误拦截任务。9.0 GiB 仍能挡住明显不足的情况，同时给浏览器和桌面合成器留出合理余量。
+DEFAULT_MIN_CUDA_FREE_GB = 9.0
 
 
 class GpuSafetyPrecheckError(RuntimeError):
@@ -50,29 +53,33 @@ class GpuSafetyPrecheckError(RuntimeError):
 # 贪心分句使用的边界集合。
 STRONG_BOUNDARIES = {"。", "！", "？", "?", "!", "."}
 SOFT_BOUNDARIES = {"，", ",", "；", ";"}
-COMMON_PUNCTS = STRONG_BOUNDARIES | SOFT_BOUNDARIES | {
-    "：",
-    ":",
-    "、",
-    "“",
-    "”",
-    '"',
-    "‘",
-    "’",
-    "'",
-    "（",
-    "）",
-    "(",
-    ")",
-    "【",
-    "】",
-    "[",
-    "]",
-    "<",
-    ">",
-    "—",
-    "-",
-}
+COMMON_PUNCTS = (
+    STRONG_BOUNDARIES
+    | SOFT_BOUNDARIES
+    | {
+        "：",
+        ":",
+        "、",
+        "“",
+        "”",
+        '"',
+        "‘",
+        "’",
+        "'",
+        "（",
+        "）",
+        "(",
+        ")",
+        "【",
+        "】",
+        "[",
+        "]",
+        "<",
+        ">",
+        "—",
+        "-",
+    }
+)
 
 # 标点清理映射表：
 # - 左边是常见的半角英文标点，右边是中文语音转写里更自然的全角标点。
@@ -88,6 +95,7 @@ PUNCT_NORMALIZE_MAP = {
     "(": "（",
     ")": "）",
 }
+
 
 @dataclass
 class CharStamp:
@@ -195,9 +203,7 @@ def validate_wav_output(wav_path: Path, purpose: str) -> None:
         ) from exc
 
     if info.frames <= 0 or info.samplerate <= 0 or info.channels <= 0:
-        raise RuntimeError(
-            f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：没有有效音频数据 {wav_path}"
-        )
+        raise RuntimeError(f"{purpose}输出无效，可能是 ffmpeg 或磁盘写入异常：没有有效音频数据 {wav_path}")
 
 
 def ffmpeg_convert_to_wav16k_mono(src_audio: Path, dst_wav: Path) -> None:
@@ -454,21 +460,35 @@ def load_qwen_asr_model(
             max_new_tokens=max_new_tokens,
             **common_kwargs,
         )
-    except TypeError:
+    except TypeError as exc:
         # 兼容不同 qwen-asr 版本的参数签名。
+        # 只有错误明确表示“不认识这个关键字参数”时才能回退。模型内部也可能抛 TypeError；
+        # 如果把内部错误误当成版本兼容问题，会重复加载大模型并掩盖真正根因。
+        if not is_unexpected_keyword_type_error(exc, {"max_inference_batch_size", "max_new_tokens"}):
+            raise
         try:
             model = Qwen3ASRModel.from_pretrained(
                 asr_ckpt,
                 max_inference_batch_size=requested_batch_size,
                 **common_kwargs,
             )
-        except TypeError:
+        except TypeError as retry_exc:
+            if not is_unexpected_keyword_type_error(retry_exc, {"max_inference_batch_size"}):
+                raise
             model = Qwen3ASRModel.from_pretrained(
                 asr_ckpt,
                 **common_kwargs,
             )
 
     return model
+
+
+def is_unexpected_keyword_type_error(exc: TypeError, keywords: set[str]) -> bool:
+    """判断 TypeError 是否仅仅由第三方库版本不支持某个关键字参数引起。"""
+    message = str(exc).lower()
+    if "unexpected keyword argument" not in message:
+        return False
+    return any(keyword.lower() in message for keyword in keywords)
 
 
 def is_memory_pressure_error(exc: BaseException) -> bool:
@@ -589,11 +609,7 @@ def transcribe_with_timestamps(
     done = threading.Event()
     safe_rtf = max(0.05, float(eta_rtf))
     expected_total = max(5.0, float(wav_duration_sec) / safe_rtf)
-    log(
-        "步骤 3/5 预计总耗时 ~"
-        f"{format_seconds_short(expected_total)} "
-        f"(估算速度 {safe_rtf:.2f}x 实时，仅供参考)"
-    )
+    log(f"步骤 3/5 预计总耗时 ~{format_seconds_short(expected_total)} (估算速度 {safe_rtf:.2f}x 实时，仅供参考)")
 
     def heartbeat() -> None:
         while not done.wait(progress_interval_sec):
@@ -667,11 +683,7 @@ def transcribe_with_timestamps(
 
     elapsed = float(time.time() - start_ts)
     speed_x = (float(wav_duration_sec) / elapsed) if elapsed > 0 else 0.0
-    log(
-        "步骤 3/5 完成，用时 "
-        f"{format_seconds_short(elapsed)} "
-        f"(约 {speed_x:.2f}x 实时)"
-    )
+    log(f"步骤 3/5 完成，用时 {format_seconds_short(elapsed)} (约 {speed_x:.2f}x 实时)")
     return "".join(all_text), all_timestamps, merge_language_labels(detected_languages)
 
 
@@ -739,22 +751,37 @@ def normalize_punctuation_text(text: str) -> str:
 
     这里做的事情很保守：
     1. 把常见英文标点换成中文标点，例如 `,` -> `，`。
-    2. 删除标点前后的多余空格，避免出现 `你好 ， 世界`。
+    2. 删除标点前后的多余空格，避免出现 `你好 ， 世界`；但保留 `hello world` 这类英文词间空格。
     3. 连续重复的标点只保留一个，避免出现 `，，`、`！！`。
     4. 不修改汉字、英文、数字本身。
     """
+    mapped_text = "".join(PUNCT_NORMALIZE_MAP.get(ch, ch) for ch in (text or ""))
     normalized_chars: list[str] = []
     previous_punct = ""
 
-    for raw_ch in text or "":
-        if raw_ch.isspace():
-            # 中文转写通常不需要空格；保留空格反而会干扰字符级时间线。
+    for index, ch in enumerate(mapped_text):
+        if ch.isspace():
+            # 中文汉字之间的模型空格通常是排版噪声；英文、数字、阿拉伯文等语言则依赖空格分词。
+            # 仅在空格两侧都是正文、且不全是中日韩文字时保留一个空格，并始终删除标点两侧空格。
+            previous = normalized_chars[-1] if normalized_chars else ""
+            following = next((item for item in mapped_text[index + 1 :] if not item.isspace()), "")
+            should_keep = (
+                bool(previous)
+                and bool(following)
+                and previous not in COMMON_PUNCTS
+                and following not in COMMON_PUNCTS
+                and not (is_compact_east_asian_character(previous) and is_compact_east_asian_character(following))
+            )
+            if should_keep and previous != " ":
+                normalized_chars.append(" ")
             continue
 
-        ch = PUNCT_NORMALIZE_MAP.get(raw_ch, raw_ch)
         is_punct = ch in COMMON_PUNCTS
 
         if is_punct:
+            # 前一个正文与标点之间不留空格，例如 `hello ,` 会规范成 `hello，`。
+            if normalized_chars and normalized_chars[-1] == " ":
+                normalized_chars.pop()
             if normalized_chars and normalized_chars[-1] == ch:
                 # 相同标点连续出现，大概率是标点模型抖动，直接去重。
                 continue
@@ -769,6 +796,22 @@ def normalize_punctuation_text(text: str) -> str:
         previous_punct = ""
 
     return "".join(normalized_chars).strip()
+
+
+def is_compact_east_asian_character(ch: str) -> bool:
+    """判断字符是否属于通常不靠空格分词的汉字/日文假名。
+
+    韩文虽然常被归入 CJK（中日韩）类别，但现代韩文正字法需要词间空格，因此这里不能把 Hangul 算进去。
+    """
+    if not ch:
+        return False
+    codepoint = ord(ch[0])
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x3040 <= codepoint <= 0x30FF
+    )
 
 
 def text_without_punctuation(text: str) -> str:
@@ -819,10 +862,14 @@ def apply_punctuation(raw_text: str, punc_model_name: str) -> str:
         # 这样做可以减少每次任务启动时的联网检查时间；如果旧版 FunASR 不支持该参数，就回退到兼容写法。
         # 标点模型只处理文字，不需要占用 GPU；固定到 CPU 可以避免它继续挤占 12GB 显卡的显存。
         model = AutoModel(model=punc_model_name, disable_update=True, device="cpu")
-    except TypeError:
+    except TypeError as exc:
+        if not is_unexpected_keyword_type_error(exc, {"disable_update", "device"}):
+            raise
         try:
             model = AutoModel(model=punc_model_name, device="cpu")
-        except TypeError:
+        except TypeError as retry_exc:
+            if not is_unexpected_keyword_type_error(retry_exc, {"device"}):
+                raise
             model = AutoModel(model=punc_model_name)
     output = model.generate(input=raw_text)
     text = extract_text_from_punc_result(output)
@@ -838,6 +885,17 @@ def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: st
 
     for ch in normalize_punctuation_text(punc_text):
         if ch.isspace():
+            # 空格没有独立语音时长，但英文分词必须保留。若原始 ASR 时间线包含空格就消费它；
+            # 否则把零时长空格挂在前一个字符末尾，不会改变切出的 wav 起止点。
+            while i < len(raw_timeline) and raw_timeline[i].char.isspace():
+                i += 1
+            if merged:
+                space_time = merged[-1].end
+            elif i < len(raw_timeline):
+                space_time = raw_timeline[i].start
+            else:
+                space_time = 0.0
+            merged.append(CharStamp(ch, space_time, space_time))
             continue
 
         if ch in COMMON_PUNCTS:
@@ -863,9 +921,7 @@ def merge_punc_text_to_timeline(raw_timeline: Sequence[CharStamp], punc_text: st
             i += 1
 
         if i >= len(raw_timeline) or raw_timeline[i].char != ch:
-            raise ValueError(
-                "标点文本无法安全合并到时间线，已拒绝使用该标点结果，避免文本和音频错位。"
-            )
+            raise ValueError("标点文本无法安全合并到时间线，已拒绝使用该标点结果，避免文本和音频错位。")
 
         ref = raw_timeline[i]
         merged.append(CharStamp(ch, ref.start, ref.end))
@@ -1095,9 +1151,7 @@ def export_qwen3_tts_manifest(
 
 def parse_args() -> argparse.Namespace:
     split_defaults = read_split_defaults()
-    parser = argparse.ArgumentParser(
-        description="Qwen3-ASR + Qwen3-ForcedAligner sentence-level segmentation tool."
-    )
+    parser = argparse.ArgumentParser(description="Qwen3-ASR + Qwen3-ForcedAligner sentence-level segmentation tool.")
     parser.add_argument("--audio", required=True, help="Input audio file path")
     parser.add_argument("--out_dir", default="", help="Output directory (auto if empty)")
     parser.add_argument(
@@ -1126,8 +1180,12 @@ def parse_args() -> argparse.Namespace:
         default=split_defaults["pause_threshold"],
         help="Pause split threshold (s)",
     )
-    parser.add_argument("--min_dur", type=float, default=split_defaults["min_dur"], help="Minimum sentence duration (s)")
-    parser.add_argument("--max_dur", type=float, default=split_defaults["max_dur"], help="Maximum sentence duration (s)")
+    parser.add_argument(
+        "--min_dur", type=float, default=split_defaults["min_dur"], help="Minimum sentence duration (s)"
+    )
+    parser.add_argument(
+        "--max_dur", type=float, default=split_defaults["max_dur"], help="Maximum sentence duration (s)"
+    )
     parser.add_argument("--pad_left", type=float, default=split_defaults["pad_left"], help="Left padding (s)")
     parser.add_argument("--pad_right", type=float, default=split_defaults["pad_right"], help="Right padding (s)")
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS, help="ASR max_new_tokens")
@@ -1176,16 +1234,12 @@ def parse_args() -> argparse.Namespace:
 
 def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = False) -> int:
     dataset_format = str(args.dataset_format or "standard").strip().lower()
-    if batch_size < 1:
-        raise ValueError("batch_size 必须是大于等于 1 的整数。")
-    if int(args.max_new_tokens) < 64:
-        raise ValueError("max_new_tokens 至少建议为 64；太小会导致识别文本被截断。")
-    if float(args.chunk_seconds) < 5:
-        raise ValueError("chunk_seconds 至少建议为 5 秒；太小会把一句话切得过碎，影响上下文。")
-    if float(args.min_cuda_free_gb) < 0:
-        raise ValueError("min_cuda_free_gb 不能为负数；设为 0 表示关闭显存预检。")
+    validate_runtime_args(args, batch_size)
 
     audio_path = Path(args.audio).expanduser().resolve()
+    if not audio_path.exists() or not audio_path.is_file():
+        raise ValueError(f"audio 必须指向一个存在的音频文件，当前路径为：{audio_path}")
+
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else default_out_dir()
     ensure_dir(out_dir)
     tmp_dir = out_dir / "_tmp"
@@ -1252,6 +1306,8 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     log(f"识别语言: {detected_lang or 'unknown'}")
 
     warning_message = ""
+    punctuation_applied = False
+    punctuation_warning = ""
     units = parse_unit_timestamps(time_stamps) if time_stamps else []
     if not text.strip() and not units:
         warning_message = "音频可能为静默、噪声过大，或未包含可识别语音，最终结果为空"
@@ -1271,8 +1327,11 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
             punc_text = apply_punctuation(text, args.punc_model.strip())
             char_timeline = merge_punc_text_to_timeline(char_timeline, punc_text)
             text = punc_text
+            punctuation_applied = True
         except Exception as exc:
-            log(f"标点恢复失败，继续使用原始文本: {exc}")
+            punctuation_warning = f"标点恢复失败，已继续使用 ASR 原始文本：{exc}"
+            warning_message = "；".join(item for item in (warning_message, punctuation_warning) if item)
+            log(f"警告: {punctuation_warning}")
     elif char_timeline:
         log("步骤 4/5: 跳过标点恢复（未设置 --punc_model）")
     else:
@@ -1325,6 +1384,8 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
                 "runtime_device": "cpu_fallback" if force_cpu else "auto",
                 "detected_language": detected_lang,
                 "punc_model": args.punc_model,
+                "punctuation_applied": punctuation_applied,
+                "punctuation_warning": punctuation_warning,
                 "pause_threshold": args.pause_threshold,
                 "min_dur": args.min_dur,
                 "max_dur": args.max_dur,
@@ -1335,9 +1396,7 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
                 "ref_audio": args.ref_audio,
                 "segments": len(segments),
                 **({"warning": warning_message} if warning_message else {}),
-                "qwen3_tts_manifest": (
-                    qwen3_tts_manifest_path.name if qwen3_tts_manifest_path else ""
-                ),
+                "qwen3_tts_manifest": (qwen3_tts_manifest_path.name if qwen3_tts_manifest_path else ""),
                 "qwen3_tts_entries": len(exported_segments) if qwen3_tts_manifest_path else 0,
             },
             ensure_ascii=False,
@@ -1354,6 +1413,39 @@ def run_pipeline(args: argparse.Namespace, batch_size: int, force_cpu: bool = Fa
     if qwen3_tts_manifest_path:
         log(f"Qwen3-TTS 清单: {qwen3_tts_manifest_path}")
     return 0
+
+
+def validate_runtime_args(args: argparse.Namespace, batch_size: int) -> None:
+    """在加载模型前一次性校验数值参数，让输入错误快速、明确地失败。"""
+    if batch_size < 1:
+        raise ValueError("batch_size 必须是大于等于 1 的整数。")
+    if int(args.max_new_tokens) < 64:
+        raise ValueError("max_new_tokens 至少建议为 64；太小会导致识别文本被截断。")
+    if not math.isfinite(float(args.chunk_seconds)):
+        raise ValueError("chunk_seconds（安全分块秒数）必须是有限数字，不能是 NaN 或无穷大。")
+    if float(args.chunk_seconds) < 5:
+        raise ValueError("chunk_seconds 至少建议为 5 秒；太小会把一句话切得过碎，影响上下文。")
+    if not math.isfinite(float(args.min_cuda_free_gb)):
+        raise ValueError("min_cuda_free_gb（最低空闲显存）必须是有限数字，不能是 NaN 或无穷大。")
+    if float(args.min_cuda_free_gb) < 0:
+        raise ValueError("min_cuda_free_gb 不能为负数；设为 0 表示关闭显存预检。")
+    numeric_rules = {
+        "pause_threshold": (float(args.pause_threshold), "停顿阈值", True),
+        "min_dur": (float(args.min_dur), "最短句时长", False),
+        "max_dur": (float(args.max_dur), "最长句时长", True),
+        "pad_left": (float(args.pad_left), "左补边", False),
+        "pad_right": (float(args.pad_right), "右补边", False),
+        "eta_rtf": (float(args.eta_rtf), "ETA 实时系数", True),
+    }
+    for field_name, (value, chinese_name, must_be_positive) in numeric_rules.items():
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name}（{chinese_name}）必须是有限数字，不能是 NaN 或无穷大。")
+        if must_be_positive and value <= 0:
+            raise ValueError(f"{field_name}（{chinese_name}）必须大于 0。")
+        if not must_be_positive and value < 0:
+            raise ValueError(f"{field_name}（{chinese_name}）不能为负数。")
+    if float(args.min_dur) > float(args.max_dur):
+        raise ValueError("min_dur（最短句时长）不能大于 max_dur（最长句时长）。")
 
 
 def main() -> int:
@@ -1409,4 +1501,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[asr] 用户中断。", file=sys.stderr)
         raise SystemExit(130) from None
-

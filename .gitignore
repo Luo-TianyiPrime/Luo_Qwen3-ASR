@@ -4,10 +4,18 @@
 .playwright-cli/
 outputs/
 asr_output/
+# package_for_deploy.ps1 的默认/示例产物；ZIP 可能数 GB，不应误提交到 Git。
+Qwen3-ASR_*.zip
 models/
 inputs/
 nul
 __pycache__/
+# Python 质量工具生成的可再生缓存：不会影响运行结果，也不应进入部署包或 Git 历史。
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.pyc
 *.pyo
 *.pyd

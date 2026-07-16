@@ -600,10 +600,10 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 
 - `MaxNewTokens`：每个音频块最多生成多少 token。token 可以粗略理解为模型内部的一小段文字单位；默认 `1024`。值越大越不容易截断，但 KV 缓存越大、越吃显存，也更容易在异常片段上拖很久。
 - `ChunkSeconds`：长音频安全分块时长，默认 `60` 秒。块越短，单次峰值显存越低；4070S 12GB 如果仍然卡，可以试 `30`。
-- `MinCudaFreeGB`：GPU 推理前最低空闲显存，默认 `9.5` GiB。空闲显存不够时脚本会提前报错，避免 Windows 桌面一起卡死。
+- `MinCudaFreeGB`：GPU 推理前最低空闲显存，默认 `9.0` GiB。空闲显存不够时脚本会提前报错，避免 Windows 桌面一起卡死。这个默认值已在 RTX 4070 SUPER 12GB 上用真实 ASR 流程验证，并给 Windows 桌面显存波动留出了余量。
 - `ForceCpu`：强制 CPU 推理。速度会慢很多，但适合用短音频排查“是不是显存/GPU 导致的问题”。
 
-新手建议：`BatchSize = 1`、`MaxNewTokens = 1024`、`ChunkSeconds = 60`、`MinCudaFreeGB = 9.5` 先不要动。确认能稳定跑完后，再根据显存余量微调。
+新手建议：`BatchSize = 1`、`MaxNewTokens = 1024`、`ChunkSeconds = 60`、`MinCudaFreeGB = 9.0` 先不要动。确认能稳定跑完后，再根据显存余量微调。
 
 ### 7.10 `PauseThreshold`
 
@@ -831,6 +831,7 @@ PuncModel = "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
 - 模型路径
 - 语言设置
 - 标点模型
+- 标点恢复是否真正成功（`punctuation_applied`）以及失败时的原因（`punctuation_warning`）
 - 分句阈值
 - 导出的片段数量
 
@@ -1282,3 +1283,51 @@ http://127.0.0.1:8765
 - 任务历史和结果目录更容易对应
 - 不会污染你原来已经堆满散文件的 `outputs`
 - 更适合后续继续做结果回看和参数对比
+
+### 15.5 WebUI 配置文件为什么有 `_guide`
+
+`configs\webui\*.json` 是可复用任务预设。JSON 标准不允许写 `// 注释` 或 `# 注释`，所以本项目把面向人的完整中文解释放在 `_guide` 对象里；后端不会把 `_guide` 传给 ASR。通过 WebUI 保存配置时，说明对象也会自动补回。
+
+项目内置配置只使用 `\.\inputs`、`\.\models` 等项目相对路径，不再包含维护者电脑上的个人盘符。相对路径会以项目根目录为基准，因此把整个项目复制到其它盘符或另一台 Windows 电脑后仍可使用。
+
+## 16. 批处理失败策略与离线部署打包
+
+### 16.1 批处理遇到坏文件时会怎样
+
+目录批处理现在会记录单个失败项并继续处理后续音频，已经成功的结果不会因为某个坏文件而丢失。全部文件尝试结束后，只要存在失败项，脚本仍会返回非零退出码并打印失败清单；“非零退出码”是给 WebUI/自动化程序看的失败信号，避免部分成功被误报成全部成功。
+
+### 16.2 生成部署 ZIP
+
+```powershell
+# 默认包含项目代码和 models，排除 inputs、outputs、缓存与虚拟环境，并下载当前平台的离线依赖
+.\package_for_deploy.ps1 -OutputZip .\Qwen3-ASR_deploy.zip -TorchVariant cu124
+
+# 目标电脑可以联网时，可跳过体积较大的 wheel 下载
+.\package_for_deploy.ps1 -OutputZip .\Qwen3-ASR_online.zip -SkipWheelDownload
+
+# 只生成代码/配置/工具包，不包含数 GB 模型；目标机需另行准备 models
+.\package_for_deploy.ps1 -OutputZip .\Qwen3-ASR_code_only.zip -SkipWheelDownload -SkipModels
+```
+
+`SourceRoot` 留空时就是 `package_for_deploy.ps1` 所在的项目根目录。脚本会核验 `run.ps1`、`bootstrap.ps1`、`scripts`、`webui` 等入口，防止误把上级 `E:\models` 整体打包。默认保留临时组装目录以便核对；只有显式传入 `-RemoveStaging` 才会在校验路径后删除它。
+
+离线依赖（wheel）与 Python 版本、Windows/CPU 架构有关。建议打包机和部署机都使用 Python 3.11 x64。python.org 的 embeddable ZIP 面向应用嵌入，默认没有完整 `pip`/`venv`，不要把它当成普通 Python 安装器；部署包内生成的 `DEPLOY_GUIDE.md` 使用官方完整版安装器流程。
+
+`TorchVersion` 默认固定为本项目已实测的 `2.6.0`，并让 `torch` 与 `torchaudio` 保持同版。这样可以防止同时查询 PyPI 和 CUDA wheel 源时误选更高版本的 CPU 构建。只有在你明确需要升级时才覆盖它，升级后要重新执行环境自检和短音频真实回归。
+
+完整部署包还会检查本机 `.cache\modelscope\models\iic\punc_ct-transformer_cn-en-common-vocab471067-large`：如果 `model.pt` 和 `configuration.json` 都在，就只把这个已完成的标点模型缓存加入 ZIP，不会带入任务日志、个人偏好或下载临时目录。使用 `-SkipModels` 的代码包会跳过它。标点模型缺失时核心 ASR 仍能输出原始文字，但离线目标机无法自动补标点，`meta.json` 会明确记录这次降级。
+
+### 16.3 修改代码后的质量检查
+
+```powershell
+# 这些是开发工具，不是运行 ASR 的必需依赖
+.\.venv\Scripts\python.exe -m pip install -r .\requirements-dev.txt
+
+# 单元/接口回归、代码规则、格式和类型检查
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m ruff format --check .
+.\.venv\Scripts\python.exe -m mypy scripts webui
+```
+
+`ruff` 检查常见代码错误和统一格式；`mypy` 检查类型提示前后是否一致；`pytest` 执行纯函数、WebUI 契约和稳定性回归。它们能较早发现问题，但不能替代真实 GPU 音频流程验证。

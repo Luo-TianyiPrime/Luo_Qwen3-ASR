@@ -84,7 +84,7 @@ function Show-Usage {
         - BatchSize: ASR 内部批大小。不懂就保持 1；如果爆显存，脚本会先自动降到 1，再不行会尝试 CPU 回退
 - MaxNewTokens: 每个音频块最多生成多少 token。默认 1024；如果异常音频一直卡住，不要盲目调大
 - ChunkSeconds: 长音频安全分块时长。12GB 显卡先保持 60 秒，显存紧张时可试 30 秒
-- MinCudaFreeGB: GPU 启动前最低空闲显存。默认 9.5 GiB，用来避免 Windows 桌面一起卡死
+- MinCudaFreeGB: GPU 启动前最低空闲显存。默认 9.0 GiB，用来避免 Windows 桌面一起卡死
 - ForceCpu: 强制 CPU 推理。很慢，但能验证是不是显存/GPU 导致的问题
 - PauseThreshold / MinDur / MaxDur: 分句参数
 - EtaRTF: 只影响预计剩余时间的显示，不影响结果
@@ -131,6 +131,20 @@ function Resolve-ProjectPath {
     }
 
     return (Join-Path $ProjectRoot $PathValue)
+}
+
+function Assert-FiniteNumber {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][double]$Value,
+        [Parameter(Mandatory = $true)][string]$BeginnerHint
+    )
+
+    # NaN（Not a Number，非数字）和正负无穷大虽然属于 .NET 的 double 类型，
+    # 但不能用于时长、显存或 ETA 计算。提前拦截可以避免后面出现难理解的比较和进度显示异常。
+    if ([double]::IsNaN($Value) -or [double]::IsInfinity($Value)) {
+        throw (New-ActionableError -Problem "$Name 非法。" -Cause "该值必须是有限数字，不能是 NaN、Infinity 或 -Infinity。" -NextStep $BeginnerHint)
+    }
 }
 
 function Resolve-CkptValue {
@@ -418,7 +432,8 @@ $Config = [ordered]@{
     # - Windows 桌面也占用同一张显卡；如果 Qwen 推理把显存挤满，鼠标/窗口/整机都可能卡住
     # - 低于这个值时脚本会提前报错，让你先关闭 ComfyUI、浏览器、游戏、视频播放器等占显存程序
     # - 设为 0 可以关闭预检，但不建议新手关闭
-    MinCudaFreeGB = 9.5
+    # - 9.0 GiB 已在 RTX 4070 SUPER 12GB 上完成真实流程回归；它兼顾桌面显存波动与加载安全余量
+    MinCudaFreeGB = 9.0
 
     # 强制 CPU 推理：
     # - false = 自动优先用 CUDA，也就是显卡
@@ -577,6 +592,15 @@ if ([int]$Config.BatchSize -lt 1) {
     throw (New-ActionableError -Problem "BatchSize 非法。" -Cause "批大小至少要是 1；填成 0、负数，或者不小心传了空值都会失败。" -NextStep "先保持 `BatchSize = 1`，跑通后再慢慢调大。")
 }
 
+Assert-FiniteNumber -Name "ChunkSeconds" -Value ([double]$Config.ChunkSeconds) -BeginnerHint "12GB 显卡建议先保持 `ChunkSeconds = 60`。"
+Assert-FiniteNumber -Name "MinCudaFreeGB" -Value ([double]$Config.MinCudaFreeGB) -BeginnerHint "新手建议保持 `MinCudaFreeGB = 9.0`。"
+Assert-FiniteNumber -Name "PauseThreshold" -Value ([double]$Config.PauseThreshold) -BeginnerHint "新手建议保持 `PauseThreshold = 0.60`。"
+Assert-FiniteNumber -Name "MinDur" -Value ([double]$Config.MinDur) -BeginnerHint "新手建议保持 `MinDur = 0.80`。"
+Assert-FiniteNumber -Name "MaxDur" -Value ([double]$Config.MaxDur) -BeginnerHint "新手建议保持 `MaxDur = 8.00`。"
+Assert-FiniteNumber -Name "PadLeft" -Value ([double]$Config.PadLeft) -BeginnerHint "新手建议保持 `PadLeft = 0.05`。"
+Assert-FiniteNumber -Name "PadRight" -Value ([double]$Config.PadRight) -BeginnerHint "新手建议保持 `PadRight = 0.10`。"
+Assert-FiniteNumber -Name "EtaRTF" -Value ([double]$Config.EtaRTF) -BeginnerHint "新手建议保持 `EtaRTF = 2.0`；它只影响剩余时间估算。"
+
 if ([int]$Config.MaxNewTokens -lt 64) {
     throw (New-ActionableError -Problem "MaxNewTokens 非法。" -Cause "最大 token 数太小会把识别文本截断；填成 0、负数，或者特别小的值都不适合 ASR。" -NextStep "先保持 `MaxNewTokens = 1024`。如果某些片段被截断，再逐步提高到 1536 或 2048。")
 }
@@ -586,7 +610,27 @@ if ([double]$Config.ChunkSeconds -lt 5) {
 }
 
 if ([double]$Config.MinCudaFreeGB -lt 0) {
-    throw (New-ActionableError -Problem "MinCudaFreeGB 非法。" -Cause "最低空闲显存不能为负数；这是启动前的安全检查线。" -NextStep "新手建议保持 `MinCudaFreeGB = 9.5`；设为 0 表示关闭预检，但不建议这么做。")
+    throw (New-ActionableError -Problem "MinCudaFreeGB 非法。" -Cause "最低空闲显存不能为负数；这是启动前的安全检查线。" -NextStep "新手建议保持 `MinCudaFreeGB = 9.0`；设为 0 表示关闭预检，但不建议这么做。")
+}
+
+if ([double]$Config.PauseThreshold -le 0) {
+    throw (New-ActionableError -Problem "PauseThreshold 非法。" -Cause "停顿阈值必须大于 0 秒，否则几乎每个字符间隙都可能被误判为句子边界。" -NextStep "新手建议保持 `PauseThreshold = 0.60`。")
+}
+
+if ([double]$Config.MinDur -lt 0 -or [double]$Config.MaxDur -le 0) {
+    throw (New-ActionableError -Problem "MinDur / MaxDur 非法。" -Cause "最短句时长不能为负数，最长句时长必须大于 0 秒。" -NextStep "新手建议保持 `MinDur = 0.80`、`MaxDur = 8.00`。")
+}
+
+if ([double]$Config.MinDur -gt [double]$Config.MaxDur) {
+    throw (New-ActionableError -Problem "分句时长范围前后矛盾。" -Cause "MinDur 大于 MaxDur，脚本无法同时满足“至少这么长”和“最多这么长”。" -NextStep "把 MinDur 调小或 MaxDur 调大；新手建议使用 0.80 和 8.00。")
+}
+
+if ([double]$Config.PadLeft -lt 0 -or [double]$Config.PadRight -lt 0) {
+    throw (New-ActionableError -Problem "PadLeft / PadRight 非法。" -Cause "音频切片的左右补边不能是负数。" -NextStep "新手建议保持 `PadLeft = 0.05`、`PadRight = 0.10`。")
+}
+
+if ([double]$Config.EtaRTF -le 0) {
+    throw (New-ActionableError -Problem "EtaRTF 非法。" -Cause "ETA 实时系数必须大于 0，脚本会用它做除法估算剩余时间。" -NextStep "新手建议保持 `EtaRTF = 2.0`。")
 }
 
 if (-not (Test-Path -LiteralPath $Config.AsrCkpt)) {
@@ -664,6 +708,8 @@ Write-Host "[run] 输出根目录: $($Config.OutDir)"
 Write-Host "[run] 待处理音频数量: $total"
 $batchStart = Get-Date
 $completed = 0
+$attempted = 0
+$failedFiles = @()
 
 for ($i = 0; $i -lt $total; $i++) {
     $f = $audioFiles[$i]
@@ -683,30 +729,42 @@ for ($i = 0; $i -lt $total; $i++) {
 
     Write-Host "[run] [$idx/$total] 开始: $($f.FullName)"
     Write-Host "[run] [$idx/$total] 输出: $oneOutDir"
-    if ($completed -gt 0) {
+    if ($attempted -gt 0) {
         $elapsedBatch = ((Get-Date) - $batchStart).TotalSeconds
-        $avgPerFile = $elapsedBatch / $completed
-        $remainFiles = $total - $completed
+        $avgPerFile = $elapsedBatch / $attempted
+        $remainFiles = $total - $attempted
         $etaSec = $avgPerFile * $remainFiles
         Write-Host "[run] [$idx/$total] 批量剩余 ETA ~ $(Format-Duration $etaSec)"
     }
 
     $fileStart = Get-Date
-    Invoke-OneAudio -AudioPath $f.FullName -OutputPath $oneOutDir -Cfg $Config
-    if ($audioInputType -eq "directory" -and $Config.DatasetFormat -eq "qwen3_tts") {
-        Append-Qwen3TtsManifest -RunDir $oneOutDir -RootOutDir $Config.OutDir -Prefix $relativePrefix
+    try {
+        Invoke-OneAudio -AudioPath $f.FullName -OutputPath $oneOutDir -Cfg $Config
+        if ($audioInputType -eq "directory" -and $Config.DatasetFormat -eq "qwen3_tts") {
+            Append-Qwen3TtsManifest -RunDir $oneOutDir -RootOutDir $Config.OutDir -Prefix $relativePrefix
+        }
+        $completed += 1
+    }
+    catch {
+        # 批处理时单个坏文件不应阻止后面的正常音频。失败项会保留自己的日志/临时目录，
+        # 最后统一返回非零退出码，让 WebUI 或自动化脚本仍能正确知道“本批次并非全部成功”。
+        $failedFiles += [pscustomobject]@{
+            Path = $f.FullName
+            Error = $_.Exception.Message
+        }
+        Write-Warning "[run] [$idx/$total] 失败，继续处理后续文件：$($f.FullName)`n$($_.Exception.Message)"
     }
     $fileElapsed = ((Get-Date) - $fileStart).TotalSeconds
-    $completed += 1
+    $attempted += 1
 
     $elapsedBatch = ((Get-Date) - $batchStart).TotalSeconds
-    $avgPerFile = $elapsedBatch / $completed
-    $remainFiles = $total - $completed
+    $avgPerFile = $elapsedBatch / $attempted
+    $remainFiles = $total - $attempted
     $etaSec = $avgPerFile * $remainFiles
-    Write-Host "[run] [$idx/$total] 完成，用时 $(Format-Duration $fileElapsed)；批量剩余 ETA ~ $(Format-Duration $etaSec)"
+    Write-Host "[run] [$idx/$total] 本项结束，用时 $(Format-Duration $fileElapsed)；批量剩余 ETA ~ $(Format-Duration $etaSec)"
 }
 
-Write-Host "[run] 全部完成。处理数量: $total"
+Write-Host "[run] 批处理结束。成功: $completed；失败: $($failedFiles.Count)；总数: $total"
 Write-Host "[run] 结果根目录: $($Config.OutDir)"
 if ($Config.DatasetFormat -eq "qwen3_tts") {
     Write-Host "[run] Qwen3-TTS 清单: $(Join-Path $Config.OutDir 'qwen3_tts.jsonl')"
@@ -719,4 +777,9 @@ if ($Config.DatasetFormat -eq "qwen3_tts") {
 
 if (-not [string]::IsNullOrWhiteSpace($Config.PuncModel)) {
     Write-Host "[run] 本次已启用标点恢复。以后如果提示缺少 funasr，请先运行 ./bootstrap.ps1 -InstallFunASR。"
+}
+
+if ($failedFiles.Count -gt 0) {
+    $failedSummary = ($failedFiles | ForEach-Object { "- $($_.Path)：$($_.Error)" }) -join [Environment]::NewLine
+    throw (New-ActionableError -Problem "批处理中有 $($failedFiles.Count) 个音频失败。" -Cause "脚本已经继续处理了其余文件，成功结果不会丢失。失败清单：`n$failedSummary" -NextStep "先查看每个失败目录或 WebUI 日志的最后几行；修正损坏文件、路径或显存问题后，只重跑失败项即可。")
 }

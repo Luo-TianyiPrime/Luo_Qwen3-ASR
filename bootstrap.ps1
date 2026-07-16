@@ -2,6 +2,9 @@
     [string]$PythonExe = "python",
     [ValidateSet("auto", "cpu", "cu121", "cu124")]
     [string]$TorchVariant = "auto",
+    # PyTorch 与 torchaudio 必须使用相同版本。2.6.0 是本项目在 Python 3.11 + RTX 4070 SUPER 上完成真实 ASR 回归的版本。
+    # 如果你明确需要升级，两个包会一起改到该版本；升级后请重新运行 self_check 和短音频全流程。
+    [string]$TorchVersion = "2.6.0",
     [switch]$InstallFunASR,
     [switch]$DownloadModels,
     [switch]$DownloadAsrModel,
@@ -48,6 +51,24 @@ function Invoke-Step {
     )
     Write-Host "[bootstrap] $Message"
     & $Script
+}
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][object[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    # PowerShell 5.1 的一个容易踩坑之处：外部 exe 返回非零退出码时，即使
+    # $ErrorActionPreference = "Stop"，默认也不会进入 catch。pip 因网络或依赖冲突失败后，
+    # 脚本过去仍可能继续执行并打印“完成”。这里在每次原生命令后立刻检查 LASTEXITCODE，
+    # 把它转换成真正的异常，确保安装状态与界面提示一致。
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Description 失败（exit code=$exitCode）。请查看上方该命令最后几行输出。"
+    }
 }
 
 function Get-PythonVersion {
@@ -281,7 +302,8 @@ function Invoke-FfmpegOnlyMode {
 function Install-Torch {
     param(
         [string]$PipExe,
-        [string]$Variant
+        [string]$Variant,
+        [string]$Version
     )
 
     $resolved = $Variant
@@ -295,22 +317,24 @@ function Install-Torch {
     }
 
     Write-Host "[bootstrap] 正在安装 PyTorch / torchaudio，目标版本：$resolved"
+    $torchSpec = "torch==$Version"
+    $torchaudioSpec = "torchaudio==$Version"
     try {
         switch ($resolved) {
             "cpu" {
-                & $PipExe install -U torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+                Invoke-NativeChecked -FilePath $PipExe -Arguments @("install", "-U", $torchSpec, $torchaudioSpec, "--index-url", "https://download.pytorch.org/whl/cpu") -Description "安装 CPU 版 PyTorch"
             }
             "cu121" {
-                & $PipExe install -U torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+                Invoke-NativeChecked -FilePath $PipExe -Arguments @("install", "-U", $torchSpec, $torchaudioSpec, "--index-url", "https://download.pytorch.org/whl/cu121") -Description "安装 CUDA 12.1 版 PyTorch"
             }
             "cu124" {
-                & $PipExe install -U torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+                Invoke-NativeChecked -FilePath $PipExe -Arguments @("install", "-U", $torchSpec, $torchaudioSpec, "--index-url", "https://download.pytorch.org/whl/cu124") -Description "安装 CUDA 12.4 版 PyTorch"
             }
         }
     }
     catch {
         Write-Warning "安装指定 PyTorch 版本失败，改用默认源重试。错误：$($_.Exception.Message)"
-        & $PipExe install -U torch torchaudio
+        Invoke-NativeChecked -FilePath $PipExe -Arguments @("install", "-U", $torchSpec, $torchaudioSpec) -Description "从默认软件源安装 PyTorch"
     }
 }
 
@@ -326,7 +350,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(repo_id=r'''$RepoId''', local_dir=r'''$LocalDir''')
 print('download_ok')
 "@
-    & $PythonPath -c $script
+    Invoke-NativeChecked -FilePath $PythonPath -Arguments @("-c", $script) -Description "从 Hugging Face 下载模型 $RepoId"
 }
 
 function Download-ModelScopeModel {
@@ -341,7 +365,7 @@ from modelscope import snapshot_download
 snapshot_download(model_id=r'''$ModelId''', cache_dir=r'''$LocalDir''')
 print('download_ok')
 "@
-    & $PythonPath -c $script
+    Invoke-NativeChecked -FilePath $PythonPath -Arguments @("-c", $script) -Description "从 ModelScope 下载模型 $ModelId"
 }
 
 function Ensure-ModelDownloadPython {
@@ -350,17 +374,17 @@ function Ensure-ModelDownloadPython {
     if (-not (Test-Path -LiteralPath $ModelDownloadPython)) {
         New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot ".cache") | Out-Null
         Write-Host "[bootstrap] 创建轻量模型下载环境：$ModelDownloadVenvPath"
-        & $PythonExe -m venv $ModelDownloadVenvPath
+        Invoke-NativeChecked -FilePath $PythonExe -Arguments @("-m", "venv", $ModelDownloadVenvPath) -Description "创建模型下载虚拟环境"
     }
 
     Write-Host "[bootstrap] 准备模型下载依赖：$Hub"
-    & $ModelDownloadPython -m pip install -U pip setuptools wheel
+    Invoke-NativeChecked -FilePath $ModelDownloadPython -Arguments @("-m", "pip", "install", "-U", "pip", "setuptools", "wheel") -Description "升级模型下载环境的 pip / setuptools / wheel"
     switch ($Hub) {
         "hf" {
-            & $ModelDownloadPython -m pip install huggingface_hub
+            Invoke-NativeChecked -FilePath $ModelDownloadPython -Arguments @("-m", "pip", "install", "huggingface_hub") -Description "安装 Hugging Face 下载依赖"
         }
         "modelscope" {
-            & $ModelDownloadPython -m pip install modelscope
+            Invoke-NativeChecked -FilePath $ModelDownloadPython -Arguments @("-m", "pip", "install", "modelscope") -Description "安装 ModelScope 下载依赖"
         }
     }
     return $ModelDownloadPython
@@ -467,27 +491,27 @@ try {
 
     Invoke-Step "创建或复用虚拟环境：$VenvPath" {
         if (-not (Test-Path -LiteralPath $VenvPython)) {
-            & $PythonExe -m venv $VenvPath
+            Invoke-NativeChecked -FilePath $PythonExe -Arguments @("-m", "venv", $VenvPath) -Description "创建项目虚拟环境"
         }
     }
 
     Invoke-Step "升级 pip / setuptools / wheel" {
-        & $VenvPython -m pip install -U pip setuptools wheel
+        Invoke-NativeChecked -FilePath $VenvPython -Arguments @("-m", "pip", "install", "-U", "pip", "setuptools", "wheel") -Description "升级项目虚拟环境的 pip / setuptools / wheel"
     }
 
     Invoke-Step "安装 PyTorch" {
-        Install-Torch -PipExe $VenvPip -Variant $TorchVariant
+        Install-Torch -PipExe $VenvPip -Variant $TorchVariant -Version $TorchVersion
     }
 
     Invoke-Step "安装项目核心依赖" {
         if (-not (Test-Path -LiteralPath $RequirementsPath -PathType Leaf)) {
             throw "未找到 requirements.txt：$RequirementsPath"
         }
-        & $VenvPip install -r $RequirementsPath
+        Invoke-NativeChecked -FilePath $VenvPip -Arguments @("install", "-r", $RequirementsPath) -Description "安装 requirements.txt 中的项目依赖"
         Write-Host "[bootstrap] FunASR 已作为项目依赖安装，用于默认的标点恢复。"
         if ($InstallFunASR) {
             Write-Host "[bootstrap] 已收到 -InstallFunASR，额外执行一次 FunASR 升级/修复安装，适合旧环境补依赖。"
-            & $VenvPip install -U funasr
+            Invoke-NativeChecked -FilePath $VenvPip -Arguments @("install", "-U", "funasr") -Description "升级或修复 FunASR"
         }
     }
 
@@ -520,7 +544,7 @@ try {
 
     if (Test-Path -LiteralPath (Join-Path $ProjectRoot "scripts\self_check.py")) {
         Invoke-Step "运行环境自检" {
-            & $VenvPython (Join-Path $ProjectRoot "scripts\self_check.py")
+            Invoke-NativeChecked -FilePath $VenvPython -Arguments @((Join-Path $ProjectRoot "scripts\self_check.py")) -Description "运行项目环境自检"
         }
     }
     else {

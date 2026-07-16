@@ -1,16 +1,16 @@
-<#
+﻿<#
 .SYNOPSIS
     Qwen3-ASR 离线打包脚本 — 一键生成"开箱即用"的部署包
 .DESCRIPTION
     在隔离的临时文件夹中组装项目，剔除缓存/产出物，
-    附带离线依赖包（.whl）+ 便携 Python 下载指引，
+    附带离线依赖包（.whl）+ 完整版 Python 安装指引，
     最终输出标准 ZIP 压缩包。
 .NOTES
     绝不修改原始工作区任何文件。所有操作均在独立临时文件夹中完成。
 #>
 
 param(
-    # 原始项目根目录（默认当前脚本所在目录的上级，即 E:\models\Qwen3-ASR）
+    # 原始项目根目录。留空时就是本脚本所在的 Qwen3-ASR 目录；不要填写它的上级 models 目录。
     [string]$SourceRoot = "",
 
     # 输出 ZIP 路径（留空则放在 %TEMP%\Qwen3-ASR_Package_时间戳.zip）
@@ -19,12 +19,21 @@ param(
     # 是否跳过离线 whl 包下载（目标设备网络可用时可跳过）
     [switch]$SkipWheelDownload,
 
-    # 便携 Python 版本（仅记录到 README，不自动下载）
+    # 目标 Python 版本（仅用于生成安装指引；脚本不会擅自安装系统软件）
     [string]$PortablePythonVersion = "3.11.9",
 
     # PyTorch 变体：auto / cpu / cu121 / cu124
     [ValidateSet("auto", "cpu", "cu121", "cu124")]
-    [string]$TorchVariant = "auto"
+    [string]$TorchVariant = "auto",
+
+    # 离线 wheel 中 torch/torchaudio 的共同版本。2.6.0 是当前项目已完成真实 CUDA 推理回归的稳定基线。
+    [string]$TorchVersion = "2.6.0",
+
+    # 生成“代码包”时跳过数 GB 的 models 目录。目标机必须另行复制模型或联网运行 bootstrap 下载。
+    [switch]$SkipModels,
+
+    # 打包成功后删除临时组装目录。默认不删除，方便核对内容，也避免脚本在无人值守时执行递归删除。
+    [switch]$RemoveStaging
 )
 
 Set-StrictMode -Version Latest
@@ -51,16 +60,39 @@ function Log-Warn {
     Write-Warning "[package] $Msg"
 }
 
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][object[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    # PowerShell 5.1 不会自动把 pip 的非零退出码变成异常。必须立即检查 LASTEXITCODE，
+    # 否则网络中断时仍可能生成一个“看起来完成、实际缺包”的离线 ZIP。
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Description 失败（exit code=$exitCode）。请查看上方 pip 输出的最后几行。"
+    }
+}
+
 # ============================================================
 # 1. 确定源目录
 # ============================================================
 if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
-    $SourceRoot = (Get-Item $PSScriptRoot).Parent.FullName
+    $SourceRoot = $PSScriptRoot
 }
-$SourceRoot = [System.IO.Path]::GetFullPath($SourceRoot)
+$SourceRoot = [System.IO.Path]::GetFullPath($SourceRoot).TrimEnd([char[]]@('\', '/'))
 
-if (-not (Test-Path $SourceRoot)) {
+if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
     throw "源目录不存在：$SourceRoot"
+}
+
+# 用几个不会出现在普通模型仓库里的入口文件核验源目录，防止误把 E:\models 整个上级目录打进 ZIP。
+$RequiredProjectEntries = @("run.ps1", "bootstrap.ps1", "requirements.txt", "scripts", "webui")
+$MissingEntries = @($RequiredProjectEntries | Where-Object { -not (Test-Path -LiteralPath (Join-Path $SourceRoot $_)) })
+if ($MissingEntries.Count -gt 0) {
+    throw "SourceRoot 不是完整的 Qwen3-ASR 项目根目录：$SourceRoot。缺少：$($MissingEntries -join ', ')"
 }
 
 Log "源目录：$SourceRoot"
@@ -69,7 +101,26 @@ Log "源目录：$SourceRoot"
 # 2. 创建隔离打包工作目录
 # ============================================================
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$StagingDir = Join-Path $env:TEMP "Qwen3ASR_Staging_$Timestamp"
+
+# 在复制数 GB 模型之前先确定并校验输出位置。若同名 ZIP 已存在，应立即停止，
+# 既避免覆盖已有产物，也避免用户等到打包最后一步才收到错误。
+if ([string]::IsNullOrWhiteSpace($OutputZip)) {
+    $OutputZip = Join-Path $env:TEMP "Qwen3-ASR_Package_$Timestamp.zip"
+}
+if (-not $OutputZip.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
+    $OutputZip = "$OutputZip.zip"
+}
+$OutputZip = [System.IO.Path]::GetFullPath($OutputZip)
+if (Test-Path -LiteralPath $OutputZip) {
+    throw "输出 ZIP 已存在，为避免覆盖已有部署包已停止：$OutputZip。请换一个 -OutputZip 文件名。"
+}
+$OutputParent = Split-Path -Parent $OutputZip
+if (-not (Test-Path -LiteralPath $OutputParent -PathType Container)) {
+    # 只创建用户明确指定 ZIP 的父目录，不会删除或覆盖其中任何已有内容。
+    New-Item -ItemType Directory -Force -Path $OutputParent | Out-Null
+}
+
+$StagingDir = Join-Path $env:TEMP "Qwen3ASR_Staging_${Timestamp}_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
 
 Log "隔离打包目录：$StagingDir"
@@ -83,6 +134,9 @@ $ExcludeDirs = @(
     "__pycache__",
     ".venv",
     ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     ".playwright-cli",
     "outputs",
     "asr_output",
@@ -91,11 +145,18 @@ $ExcludeDirs = @(
     ".github"
 )
 
+if ($SkipModels) {
+    $ExcludeDirs += "models"
+    Log "已启用 -SkipModels：部署 ZIP 不包含本地模型，目标机需要另行准备 models 目录。"
+}
+
 # 排除的文件扩展名
 $ExcludeExtensions = @(
     ".pyc", ".pyo", ".pyd",
     ".log", ".tmp", ".temp",
     ".bak", ".swp",
+    # 旧部署 ZIP 如果位于项目根目录，绝不能再次被塞进新 ZIP；同时排除常见归档产物。
+    ".zip", ".7z", ".rar",
     ".DS_Store", "Thumbs.db"
 )
 
@@ -163,11 +224,40 @@ foreach ($file in $AllFiles) {
 
 Log "文件复制完成：已复制 $CopyCount 个文件，排除 $ExcludeCount 个文件"
 
+# `.cache` 整体必须排除，因为它还包含任务日志、下载临时文件和个人偏好；但默认标点模型也由
+# ModelScope 放在其中。完整部署包只定点复制已完成的标点模型目录，避免离线目标机首次运行时降级为无标点。
+$PunctuationModelRelativePath = "models\iic\punc_ct-transformer_cn-en-common-vocab471067-large"
+$PunctuationModelSource = Join-Path $SourceRoot ".cache\modelscope\$PunctuationModelRelativePath"
+$PunctuationModelIncluded = $false
+if (-not $SkipModels -and
+    (Test-Path -LiteralPath (Join-Path $PunctuationModelSource "model.pt") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $PunctuationModelSource "configuration.json") -PathType Leaf)) {
+    $PunctuationModelDestination = Join-Path $StagingDir ".cache\modelscope\$PunctuationModelRelativePath"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $PunctuationModelDestination) | Out-Null
+    Copy-Item -LiteralPath $PunctuationModelSource -Destination $PunctuationModelDestination -Recurse -Force
+    $PunctuationModelIncluded = $true
+    $PunctuationSize = (Get-ChildItem -LiteralPath $PunctuationModelSource -File -Recurse | Measure-Object Length -Sum).Sum
+    Log "已加入离线标点模型：$(Format-Size $PunctuationSize)"
+} elseif (-not $SkipModels) {
+    Log-Warn "本机尚无完整标点模型缓存，部署包不会包含它。目标机首次启用标点恢复时需要联网；核心 ASR 仍可运行并会明确提示降级。"
+}
+
 # ============================================================
 # 5. 创建离线依赖包（wheels）
 # ============================================================
 $OfflineDir = Join-Path $StagingDir "_offline_deps"
 New-Item -ItemType Directory -Force -Path $OfflineDir | Out-Null
+
+# 离线安装仍使用项目自己的依赖清单；额外加入 torch / torchaudio，因为它们需要按 CPU/CUDA 变体选择。
+# 直接从 wheel 文件名反推包名并不可靠（名称中可能含下划线，版本还可能带本地标签），所以不再做字符串猜测。
+$ReqFile = Join-Path $OfflineDir "requirements.txt"
+$OfflineRequirements = @(
+    "# 本文件供部署机离线安装使用；--find-links 会让 pip 从同目录查找 wheel。"
+    "# torch 与 torchaudio 必须来自同一 CPU/CUDA 变体，否则可能出现 DLL 加载失败。"
+    "torch==$TorchVersion"
+    "torchaudio==$TorchVersion"
+) + @(Get-Content -LiteralPath (Join-Path $SourceRoot "requirements.txt") -Encoding UTF8)
+[System.IO.File]::WriteAllLines($ReqFile, $OfflineRequirements, (New-Object System.Text.UTF8Encoding $false))
 
 if (-not $SkipWheelDownload) {
     # 尝试使用原始项目的 .venv 来下载依赖
@@ -186,19 +276,8 @@ if (-not $SkipWheelDownload) {
     }
 
     if ($PipExe) {
-        # 核心依赖列表
-        $Packages = @(
-            "qwen-asr",
-            "soundfile",
-            "modelscope",
-            "fastapi",
-            "uvicorn",
-            "huggingface_hub",
-            "funasr"
-        )
-
         Log "开始下载离线依赖包（.whl）到 _offline_deps/ ..."
-        Log "目标包：$($Packages -join ', ')"
+        Log "依赖来源：项目 requirements.txt + torch + torchaudio（包括它们的传递依赖）"
 
         # 解析 Torch 变体
         $ResolvedTorch = $TorchVariant
@@ -217,34 +296,15 @@ if (-not $SkipWheelDownload) {
             "cu124" { $WheelIndex = "https://download.pytorch.org/whl/cu124" }
         }
 
-        # 先下载 torch + torchaudio（指定 index）
-        if ($WheelIndex) {
-            Log "下载 PyTorch ($ResolvedTorch) ..."
-            & $PipExe download torch torchaudio -d $OfflineDir --no-deps --index-url $WheelIndex 2>&1 | ForEach-Object { Log "  $_" }
-        }
+        # PyPI 仍是普通依赖的主源，PyTorch 官方源作为额外源提供指定 CUDA/CPU 变体。
+        # 一次交给 pip 解析整张依赖图，避免逐包下载时混入另一种 torch，或漏掉传递依赖。
+        Log "下载完整依赖图，PyTorch 变体：$ResolvedTorch ..."
+        Invoke-NativeChecked -FilePath $PipExe -Arguments @(
+            "download", "-r", $ReqFile, "-d", $OfflineDir,
+            "--extra-index-url", $WheelIndex
+        ) -Description "下载离线 Python 依赖"
 
-        # 下载其余依赖
-        foreach ($pkg in $Packages) {
-            if ($pkg -in @("torch", "torchaudio")) { continue }
-            Log "下载 $pkg ..."
-            & $PipExe download $pkg -d $OfflineDir 2>&1 | ForEach-Object { Log "  $_" }
-        }
-
-        # 生成 requirements.txt
-        $ReqFile = Join-Path $OfflineDir "requirements.txt"
         $WheelFiles = Get-ChildItem -Path $OfflineDir -File -Filter "*.whl"
-        $Reqs = @()
-        foreach ($w in $WheelFiles) {
-            # 从 wheel 文件名提取包名和版本
-            # 格式：{name}-{version}(-{build})?-{python}-{abi}-{platform}.whl
-            $Parts = $w.BaseName -split "-"
-            if ($Parts.Count -ge 2) {
-                $Name = $Parts[0]
-                $Version = $Parts[1]
-                $Reqs += "$Name==$Version"
-            }
-        }
-        [System.IO.File]::WriteAllLines($ReqFile, $Reqs, (New-Object System.Text.UTF8Encoding $false))
 
         $WheelSize = (Get-ChildItem -Path $OfflineDir -File | Measure-Object -Property Length -Sum).Sum
         Log "离线依赖包下载完成：$($WheelFiles.Count) 个文件，$(Format-Size $WheelSize)"
@@ -256,69 +316,65 @@ if (-not $SkipWheelDownload) {
 # ============================================================
 # 6. 生成部署指引 README
 # ============================================================
+$ModelsGuide = if ($SkipModels) {
+    "AI 模型文件（本包使用 -SkipModels，未包含；请另行复制或联网运行 bootstrap 下载）"
+} else {
+    "AI 模型文件（本包已包含，无需重复下载）"
+}
+$PunctuationGuide = if ($PunctuationModelIncluded) {
+    "默认 FunASR 标点模型（已从本机完整缓存加入，可离线恢复标点）"
+} else {
+    "默认 FunASR 标点模型（本包未包含；首次使用需联网下载，失败时核心 ASR 会保留无标点结果并给出警告）"
+}
+
 $DeployReadme = @"
 # Qwen3-ASR 部署包
 
 ## 快速开始
 
 ### 前置条件
+
 - Windows 10/11
-- Python $PortablePythonVersion（推荐使用便携版或官方安装包）
-  - 便携版下载：https://www.python.org/ftp/python/$PortablePythonVersion/python-$PortablePythonVersion-embed-amd64.zip
-  - 或使用 conda / 系统安装的 Python 3.11+
+- 完整版 64 位 Python $PortablePythonVersion（Python 3.10/3.11 均可，推荐与打包机版本一致）
+  - 官方安装器：https://www.python.org/ftp/python/$PortablePythonVersion/python-$PortablePythonVersion-amd64.exe
+  - 安装时勾选 **Add Python to PATH**；它表示让 PowerShell 能直接找到 \`python\` 命令
 
-### 方式一：使用便携 Python（推荐离线部署）
+> 不要使用 python.org 的 embeddable ZIP 执行下面步骤。那个包面向应用嵌入，默认没有完整 pip，
+> 也不保证支持 \`python -m venv\`；简单解压 \`python311.zip\` 并不能正确“启用 pip”。
 
-1. 下载便携 Python 并解压到本目录的 \`_portable_python\` 文件夹
-   - 下载地址：https://www.python.org/ftp/python/$PortablePythonVersion/python-$PortablePythonVersion-embed-amd64.zip
-2. 解压 \`python$($PortablePythonVersion.Split('.')[0..1] -join '')_zip.zip\`（在便携 Python 压缩包内）
-   - 这一步是为了启用 pip
-3. 打开 PowerShell，执行：
+### 方式一：完整 Python + 离线 wheel（推荐离线部署）
+
+1. 在联网电脑下载并安装上面的官方 64 位 Python 安装器。
+2. 把本 ZIP 解压到目标电脑，在项目目录打开 PowerShell。
+3. 确认 \`_offline_deps\` 中除了 requirements.txt 之外还有许多 \`.whl\` 文件，然后执行：
 
    \`\`\`powershell
-   # 创建虚拟环境
-   .\_portable_python\python.exe -m venv .venv
+   # 创建隔离虚拟环境；它避免本项目依赖污染系统里的其它 Python 项目
+   python -m venv .venv
 
-   # 安装离线依赖
+   # --no-index 表示完全不联网；--find-links 指定本地 wheel 所在目录
    .\.venv\Scripts\pip.exe install --no-index --find-links=./_offline_deps -r ./_offline_deps/requirements.txt
 
    # 启动 WebUI
    .\run_webui.bat
    \`\`\`
 
-### 方式二：使用系统已安装的 Python
+### 方式二：联网一键初始化
 
 \`\`\`powershell
-# 创建虚拟环境
-python -m venv .venv
-
-# 激活
-.\\.venv\\Scripts\\Activate.ps1
-
-# 如果有离线包，优先使用
-if (Test-Path ./_offline_deps) {
-    pip install --no-index --find-links=./_offline_deps -r ./_offline_deps/requirements.txt
-} else {
-    # 在线安装
-    pip install qwen-asr soundfile modelscope fastapi uvicorn huggingface_hub funasr
-    pip install torch torchaudio   # 根据 GPU 情况选择 CPU 或 CUDA 版本
-}
+# bootstrap 会创建虚拟环境、安装 requirements.txt、自检 ffmpeg，并在失败时给出中文下一步
+.\\bootstrap.ps1
 
 # 启动 WebUI
 .\\run_webui.bat
-\`\`\`
-
-### 方式三：一键初始化（如果有网络）
-
-\`\`\`powershell
-.\\bootstrap.ps1
 \`\`\`
 
 ## 目录说明
 
 | 路径 | 说明 |
 |------|------|
-| \`models/\` | AI 模型文件（已包含，无需下载） |
+| \`models/\` | $ModelsGuide |
+| \`.cache/modelscope/\` | $PunctuationGuide |
 | \`webui/\` | Web 界面源代码 |
 | \`scripts/\` | 核心处理脚本 |
 | \`configs/\` | 配置文件 |
@@ -333,8 +389,10 @@ if (Test-Path ./_offline_deps) {
 
 ## 注意事项
 
-- 首次运行时，\`outputs/\` 和 \`inputs/\` 目录会自动创建
+- 本打包脚本会创建空的 \`inputs/\` 和 \`outputs/\` 目录
 - 如果有 NVIDIA GPU，确保安装了对应 CUDA 版本的 PyTorch
+- 离线 wheel 与 Python 版本、Windows/CPU 架构有关；请尽量在与部署机相同的 Python 3.11 x64 环境中打包
+- 标点恢复是识别后的可选文本处理。标点模型未包含或加载失败时，核心 ASR 不会丢结果，但 `meta.json` 会记录降级原因
 - 模型文件较大，ZIP 包可能超过 5GB，解压需要足够磁盘空间
 "@
 
@@ -374,25 +432,13 @@ Log "========================================"
 # ============================================================
 # 9. 压缩为 ZIP
 # ============================================================
-if ([string]::IsNullOrWhiteSpace($OutputZip)) {
-    $OutputZip = Join-Path $env:TEMP "Qwen3-ASR_Package_$Timestamp.zip"
-}
-
-# 确保 .zip 后缀
-if (-not $OutputZip.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
-    $OutputZip = "$OutputZip.zip"
-}
-
-$OutputZip = [System.IO.Path]::GetFullPath($OutputZip)
-
 Log "开始压缩为 ZIP：$OutputZip"
 $CompressStart = Get-Date
 
 # 使用 .NET 原生压缩（无需额外依赖）
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-# 获取父目录名（Qwen3-ASR_Package_时间戳）作为 ZIP 内根文件夹
-$ZipRootName = [System.IO.Path]::GetFileName($StagingDir)
+# CreateFromDirectory 会把组装目录中的内容直接放到 ZIP 根层，解压后即可看到 run.ps1 和 DEPLOY_GUIDE.md。
 [System.IO.Compression.ZipFile]::CreateFromDirectory($StagingDir, $OutputZip)
 
 $CompressElapsed = ((Get-Date) - $CompressStart).TotalSeconds
@@ -404,10 +450,16 @@ Log "  ZIP 大小：$(Format-Size $ZipSize)"
 Log "  压缩耗时：$([math]::Round($CompressElapsed, 1)) 秒"
 
 # ============================================================
-# 10. 清理临时打包目录（可选，默认保留以便调试）
+# 10. 清理临时打包目录（仅显式传入 -RemoveStaging 时执行）
 # ============================================================
-$question = Read-Host "是否删除临时打包目录 ($StagingDir)？(y/n)"
-if ($question -eq "y") {
+$resolvedTemp = [System.IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+$resolvedStaging = [System.IO.Path]::GetFullPath($StagingDir)
+if ($RemoveStaging) {
+    # 递归删除前再次确认目标确实位于系统临时目录，且名称带本脚本专用前缀。
+    if (-not $resolvedStaging.StartsWith($resolvedTemp, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not ([System.IO.Path]::GetFileName($resolvedStaging)).StartsWith("Qwen3ASR_Staging_")) {
+        throw "拒绝清理异常路径：$resolvedStaging"
+    }
     Remove-Item -LiteralPath $StagingDir -Recurse -Force
     Log "已删除临时打包目录"
 } else {

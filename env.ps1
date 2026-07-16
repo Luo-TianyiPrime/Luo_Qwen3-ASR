@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # 项目根目录（固定为当前脚本所在目录）
@@ -13,7 +13,6 @@ $Dirs = @(
     $CacheRoot,
     (Join-Path $CacheRoot "hf"),
     (Join-Path $CacheRoot "hf\hub"),
-    (Join-Path $CacheRoot "transformers"),
     (Join-Path $CacheRoot "torch"),
     (Join-Path $CacheRoot "modelscope"),
     (Join-Path $CacheRoot "xdg"),
@@ -30,10 +29,13 @@ foreach ($Dir in $Dirs) {
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 }
 
-# 常用缓存环境变量全部指向项目目录
+# 常用缓存环境变量全部指向项目目录。
+# HF_HOME 是 Hugging Face 现在推荐的总缓存根目录，HUGGINGFACE_HUB_CACHE 进一步指定模型快照位置。
+# 旧的 TRANSFORMERS_CACHE 已被 Transformers 标记为弃用并计划在 v5 移除，所以这里不再设置它；
+# 如果父 PowerShell 以前设置过该变量，也主动清除，避免每次运行都出现弃用警告。
 $env:HF_HOME = Join-Path $CacheRoot "hf"
 $env:HUGGINGFACE_HUB_CACHE = Join-Path $CacheRoot "hf\hub"
-$env:TRANSFORMERS_CACHE = Join-Path $CacheRoot "transformers"
+Remove-Item Env:TRANSFORMERS_CACHE -ErrorAction SilentlyContinue
 $env:TORCH_HOME = Join-Path $CacheRoot "torch"
 $env:MODELSCOPE_CACHE = Join-Path $CacheRoot "modelscope"
 $env:XDG_CACHE_HOME = Join-Path $CacheRoot "xdg"

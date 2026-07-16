@@ -1,7 +1,41 @@
 {
-  "audio": "D:\\训练集\\音频_暖暖\\总和\\WAV",
-  "output_mode": "custom",
-  "output_dir": "E:\\models\\Qwen3-TTS_LoRA\\asr_output",
+  "_guide": {
+    "purpose": "Qwen3-TTS 微调数据导出示例。它只提供可迁移的安全起点，不包含维护者个人电脑上的训练集盘符。",
+    "beginner_notes": [
+      "先把待识别音频放入 .\\inputs；任务会在项目 outputs/webui_runs 下生成独立结果和 qwen3_tts.jsonl。",
+      "ref_audio 是清单中的可选参考音频，不是待识别目录；不确定时保持空字符串。",
+      "热词只提供识别上下文提示，不能保证强制替换；请在导入训练前抽样核对文字与音频是否一致。"
+    ],
+    "fields": {
+      "audio": "待识别音频或目录，示例使用项目内 inputs。",
+      "output_mode": "auto 为每次任务创建独立目录，避免覆盖已有微调数据。",
+      "output_dir": "仅 custom 模式使用；本示例 auto 模式保持空。",
+      "dataset_format": "qwen3_tts 会额外生成适合继续整理的微调 JSONL 清单。",
+      "ref_audio": "清单中的可选参考音频路径；无明确需求时留空。",
+      "hotword_library": "Nikki.txt 是项目示例热词库；不存在时任务会给出提示并忽略。",
+      "hotword_text": "临时热词正文；选择热词库后 WebUI 会加载，可在单次任务内修改。",
+      "asr_ckpt": "负责语音转文字的 Qwen3-ASR 本地模型。",
+      "aligner_ckpt": "负责把文字对齐到音频时间轴的本地模型。",
+      "language": "Chinese 为模型提供中文语言先验。",
+      "punc_model": "给识别文字恢复标点，以便得到更自然的句子边界。",
+      "batch_size": "推理批大小，12 GB 显卡推荐 1。",
+      "max_new_tokens": "每个分块最大生成 Token 数，推荐 1024。",
+      "chunk_seconds": "长音频安全分块秒数，12 GB 显卡推荐 60。",
+      "min_cuda_free_gb": "启动前最低空闲显存（GiB），默认 9.0。",
+      "force_cpu": "true 强制 CPU 推理，仅用于排查 CUDA 问题。",
+      "pause_threshold": "停顿分句阈值（秒）；本预设用 1.0，倾向减少过碎片段。",
+      "min_dur": "最短片段时长（秒）；本预设用 3.0，适合训练数据的较完整语句。",
+      "max_dur": "最长片段目标时长（秒）；本预设用 20.0，导入训练前仍需抽样检查。",
+      "pad_left": "句首补边秒数，减少切掉起始音素。",
+      "pad_right": "句尾补边秒数，减少切掉尾音。",
+      "eta_rtf": "只影响预计剩余时间显示，不影响识别和切分。",
+      "long_audio_warning_minutes": "长音频网页提醒阈值（分钟），不会阻止提交。",
+      "scan_subfolders": "true 递归读取 inputs 的子目录；大型目录请注意文件数量。"
+    }
+  },
+  "audio": ".\\inputs",
+  "output_mode": "auto",
+  "output_dir": "",
   "dataset_format": "qwen3_tts",
   "ref_audio": "",
   "hotword_library": "Nikki.txt",
@@ -13,7 +47,7 @@
   "batch_size": 1,
   "max_new_tokens": 1024,
   "chunk_seconds": 60.0,
-  "min_cuda_free_gb": 9.5,
+  "min_cuda_free_gb": 9.0,
   "force_cpu": false,
   "pause_threshold": 1.0,
   "min_dur": 3.0,
@@ -21,5 +55,6 @@
   "pad_left": 0.1,
   "pad_right": 0.1,
   "eta_rtf": 2.0,
+  "long_audio_warning_minutes": 120,
   "scan_subfolders": true
 }

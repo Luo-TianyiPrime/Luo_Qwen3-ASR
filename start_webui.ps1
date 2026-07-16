@@ -611,6 +611,14 @@ Write-Host "[状态] 跳过 ffmpeg 自动安装：$skipFfmpegInstall"
 Write-Host "[状态] PyTorch 安装策略：$TorchVariant"
 Write-Host "[状态] 模型下载来源：$ModelHub"
 
+# WebUI 包含启动任务、写入配置、打开本地目录等本机管理能力，目前没有账号登录或访问令牌。
+# 绑定到 127.0.0.1 / localhost / ::1 时只有本机能访问；其它地址可能把这些能力暴露给局域网。
+$loopbackHosts = @("127.0.0.1", "localhost", "::1", "[::1]")
+if ($BindHost -notin $loopbackHosts) {
+    Write-Warning "当前 BindHost=$BindHost 不是本机回环地址，WebUI 可能被同一局域网中的其它设备访问。"
+    Write-Warning "本项目 WebUI 目前没有身份认证。除非你已配置 Windows 防火墙和可信反向代理，否则请改回默认值：-BindHost 127.0.0.1"
+}
+
 # 先探测目标端口上是否已经有可用的 WebUI。
 # 很多新手会重复双击 run_webui.bat；如果同一个项目已经在运行，最友好的行为是复用现有实例。
 $health = Invoke-WebUiJson -Url $RequestedProbeUrl
